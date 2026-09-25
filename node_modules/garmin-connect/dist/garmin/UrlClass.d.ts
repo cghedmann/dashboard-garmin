@@ -1,0 +1,36 @@
+import { GCWorkoutId, GarminDomain } from './types';
+export declare class UrlClass {
+    private domain;
+    GC_MODERN: string;
+    GARMIN_SSO_ORIGIN: string;
+    GC_API: string;
+    constructor(domain?: GarminDomain);
+    get GARMIN_SSO(): string;
+    get GARMIN_SSO_EMBED(): string;
+    get BASE_URL(): string;
+    get SIGNIN_URL(): string;
+    get LOGIN_URL(): string;
+    get OAUTH_URL(): string;
+    get USER_SETTINGS(): string;
+    get USER_PROFILE(): string;
+    get ACTIVITIES(): string;
+    get ACTIVITY(): string;
+    get STAT_ACTIVITIES(): string;
+    get DOWNLOAD_ZIP(): string;
+    get DOWNLOAD_GPX(): string;
+    get DOWNLOAD_TCX(): string;
+    get DOWNLOAD_KML(): string;
+    get UPLOAD(): string;
+    get IMPORT_DATA(): string;
+    get DAILY_STEPS(): string;
+    get DAILY_SLEEP(): string;
+    get DAILY_WEIGHT(): string;
+    get UPDATE_WEIGHT(): string;
+    get DAILY_HYDRATION(): string;
+    get HYDRATION_LOG(): string;
+    get GOLF_SCORECARD_SUMMARY(): string;
+    get GOLF_SCORECARD_DETAIL(): string;
+    get DAILY_HEART_RATE(): string;
+    WORKOUT(id?: GCWorkoutId): string;
+    get WORKOUTS(): string;
+}
