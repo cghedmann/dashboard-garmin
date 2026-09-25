@@ -1,34 +1,33 @@
 #!/usr/bin/env node
 /**
  * Training Dashboard — pulls your Garmin Connect data using cached OAuth
- * tokens and renders a single self-contained index.html you can open in
- * any browser. Never prompts for a password.
+ * tokens and renders a self-contained dashboard page. Never prompts for a
+ * password.
  *
- * SETUP (one-time)
- * -----------------
- *     npm install garmin-connect
+ * RUN MODES
+ * ---------
+ *   npm start                     Web server (what Hostinger runs). Listens on
+ *                                 process.env.PORT, builds the page in the
+ *                                 background and rebuilds it every
+ *                                 REFRESH_MINUTES.
+ *   node dashboard.js --build     One-off: write index.html next to this file
+ *                                 (the original behaviour; upload that file to
+ *                                 static hosting if you prefer).
+ *   node dashboard.js --print-token-env
+ *                                 Print your local cached tokens as two env
+ *                                 values to paste into Hostinger's hPanel.
  *
- * This uses the `garmin-connect` npm package (GCClient), which stores/reuses
- * OAuth1 + OAuth2 tokens as oauth1_token.json / oauth2_token.json in a
- * directory — the same file layout the Python `garminconnect` (garth-based)
- * library uses at ~/.garminconnect. If your ~/.garminconnect was created by
- * a DIFFERENT auth flow (some forks of the Python library use a newer
- * `garmin_tokens.json` bearer-token format), this script will detect that
- * and tell you rather than silently failing — see checkTokenStore() below.
+ * TOKENS (checked in this order)
+ * ------------------------------
+ *   1. GARMIN_OAUTH1_TOKEN + GARMIN_OAUTH2_TOKEN env vars (JSON or base64 JSON)
+ *   2. GARMIN_TOKEN_DIR env var (folder with oauth1_token.json/oauth2_token.json)
+ *   3. ./.garminconnect next to this file
+ *   4. ~/.garminconnect
  *
- * IMPORTANT CAVEAT: unlike the official-ish Python library, this JS package
- * only has first-class built-in methods for profile + activities. HRV,
- * resting HR, sleep, and VO2max are pulled via the same undocumented
- * Garmin Connect endpoints the Python library uses internally, called
- * through GCClient's raw GET support. Those exact paths aren't publicly
- * documented and can change — every one of those calls is wrapped and
- * logged to a diagnostics list so you can see exactly what worked.
- *
- * USAGE
- * -----
- *     node dashboard.js
- *
- * Re-run any time to refresh index.html.
+ * The `garmin-connect` npm package only has built-in methods for profile and
+ * activities. HRV, resting HR, sleep and VO2max come from undocumented Garmin
+ * Connect endpoints; every call is wrapped and logged to a diagnostics list so
+ * you can see exactly what worked.
  */
 
 'use strict';
@@ -36,30 +35,34 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const http = require('http');
+const crypto = require('crypto');
 
 let GarminConnect;
 try {
   ({ GarminConnect } = require('garmin-connect'));
 } catch (e) {
-  console.error('Missing dependency. Install it with:\n    npm install garmin-connect');
+  console.error('Missing dependency. Install it with:\n    npm install');
   process.exit(1);
 }
 
 // =============================================================================
-// CONFIG — edit this block
+// CONFIG — edit the defaults here, or override any of them with env vars
+// (on Hostinger: hPanel → your Node.js app → Environment variables).
 // =============================================================================
+const env = process.env;
 const CONFIG = {
-  raceName: 'REPLACE_ME Marathon',
-  raceDate: '2026-12-31', // YYYY-MM-DD
-  heightCm: 178,
-  weightKg: 70,
+  raceName: env.RACE_NAME || 'REPLACE_ME Marathon',
+  raceDate: env.RACE_DATE || '2026-12-31', // YYYY-MM-DD
+  heightCm: Number(env.HEIGHT_CM) || 178,
+  weightKg: Number(env.WEIGHT_KG) || 70,
   personalBests: {
-    '5K': 'REPLACE_ME',
-    '10K': 'REPLACE_ME',
-    'Half Marathon': 'REPLACE_ME',
-    Marathon: 'REPLACE_ME',
+    '5K': env.PB_5K || 'REPLACE_ME',
+    '10K': env.PB_10K || 'REPLACE_ME',
+    'Half Marathon': env.PB_HALF || 'REPLACE_ME',
+    Marathon: env.PB_MARATHON || 'REPLACE_ME',
   },
-  units: 'mi', // 'mi' or 'km'
+  units: env.UNITS === 'km' ? 'km' : 'mi', // 'mi' or 'km'
 };
 
 const WEEKS_TRAINING_LOAD = 12; // CTL/ATL/TSB + weekly mileage window
@@ -67,7 +70,17 @@ const WEEKS_CTL_SEED = 6;       // extra history pulled (not displayed) so CTL i
 const WEEKS_RECOVERY = 6;       // HRV / resting HR / sleep window
 const WEEKS_RECENT_RUNS = 4;    // recent runs table + pace panel window
 
-const TOKENSTORE = path.join(os.homedir(), '.garminconnect');
+const PORT = Number(env.PORT) || 3000;
+const REFRESH_MINUTES = Number(env.REFRESH_MINUTES) || 60;
+const DASHBOARD_USER = env.DASHBOARD_USER || 'runner';
+const DASHBOARD_PASSWORD = env.DASHBOARD_PASSWORD || '';
+const GARMIN_DOMAIN = env.GARMIN_DOMAIN === 'garmin.cn' ? 'garmin.cn' : 'garmin.com';
+
+const TOKEN_DIR_CANDIDATES = [
+  env.GARMIN_TOKEN_DIR,
+  path.join(__dirname, '.garminconnect'),
+  path.join(os.homedir(), '.garminconnect'),
+].filter(Boolean);
 const OUTPUT_FILE = path.join(__dirname, 'index.html');
 
 const RUNNING_TYPES = new Set([
@@ -80,11 +93,20 @@ const WORKOUT_KEYWORDS = ['interval', 'tempo', 'track', 'fartlek', 'threshold', 
 const UNIT_METERS = CONFIG.units === 'mi' ? 1609.344 : 1000.0;
 const PACE_UNIT = CONFIG.units === 'mi' ? 'mi' : 'km';
 
+function escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 // =============================================================================
-// Diagnostics — tracks which fields actually came back, so the console/page
-// tell you exactly what your account does and doesn't expose.
+// Diagnostics — tracks which fields actually came back. Reset on every build
+// so a long-running server doesn't accumulate stale entries.
 // =============================================================================
-const DIAGNOSTICS = { ok: new Set(), missing: new Set() };
+let DIAGNOSTICS = { ok: new Set(), missing: new Set() };
+function resetDiagnostics() {
+  DIAGNOSTICS = { ok: new Set(), missing: new Set() };
+}
 
 async function safe(label, fn) {
   try {
@@ -102,72 +124,95 @@ async function safe(label, fn) {
 }
 
 // =============================================================================
-// Garmin connection — reuses cached tokens only, never prompts for creds
+// Garmin connection — reuses cached tokens only, never prompts for creds.
+// Errors are thrown (not process.exit) so the web server stays up and can show
+// the problem on the page instead of crash-looping.
 // =============================================================================
-function checkTokenStore() {
-  if (!fs.existsSync(TOKENSTORE)) {
-    console.error(
-      `No cached Garmin tokens found at ${TOKENSTORE}.\n` +
-      'This script never prompts for a password. Log in once via the ' +
-      'garmin-connect package\'s normal interactive flow (or the Python ' +
-      'garminconnect library) to create the token cache, then re-run this script.'
-    );
-    process.exit(1);
-  }
-  const hasOauth = fs.existsSync(path.join(TOKENSTORE, 'oauth1_token.json'))
-    && fs.existsSync(path.join(TOKENSTORE, 'oauth2_token.json'));
-  const hasNewFormat = fs.existsSync(path.join(TOKENSTORE, 'garmin_tokens.json'));
+class SetupError extends Error {}
 
-  if (!hasOauth && hasNewFormat) {
-    console.error(
-      `${TOKENSTORE} contains garmin_tokens.json (a newer DI-OAuth bearer-token\n` +
-      'format used by some forks of the Python garminconnect library). The\n' +
-      '`garmin-connect` npm package this script uses expects the older\n' +
-      'oauth1_token.json/oauth2_token.json pair instead, so it can\'t reuse\n' +
-      'that file directly. Options:\n' +
-      '  1. Do a one-time interactive login through the garmin-connect npm\n' +
-      '     package (see its README) and save its tokens to a separate\n' +
-      "     directory with GCClient.saveTokenToFile(), then point TOKENSTORE\n" +
-      '     at that directory instead.\n' +
-      '  2. Keep using the Python dashboard.py, whose garminconnect version\n' +
-      '     matches your cached tokens.'
-    );
-    process.exit(1);
-  }
-  if (!hasOauth) {
-    console.error(
-      `${TOKENSTORE} exists but doesn't contain oauth1_token.json + oauth2_token.json.\n` +
-      'This script never prompts for a password — recreate the token cache in that ' +
-      'format first, then re-run.'
-    );
-    process.exit(1);
+function parseTokenEnv(name) {
+  const rawVal = (env[name] || '').trim();
+  if (!rawVal) return null;
+  const text = rawVal.startsWith('{') ? rawVal : Buffer.from(rawVal, 'base64').toString('utf8');
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    throw new SetupError(`${name} is set but isn't valid JSON (or base64-encoded JSON).`);
   }
 }
 
+function findTokenDir() {
+  for (const dir of TOKEN_DIR_CANDIDATES) {
+    if (fs.existsSync(path.join(dir, 'oauth1_token.json')) && fs.existsSync(path.join(dir, 'oauth2_token.json'))) {
+      return dir;
+    }
+  }
+  const newFormat = TOKEN_DIR_CANDIDATES.find((d) => fs.existsSync(path.join(d, 'garmin_tokens.json')));
+  if (newFormat) {
+    throw new SetupError(
+      `${newFormat} contains garmin_tokens.json (a newer bearer-token format used by some forks of ` +
+      'the Python garminconnect library). The garmin-connect npm package needs the ' +
+      'oauth1_token.json/oauth2_token.json pair instead. Do a one-time login with the npm package ' +
+      'and save its tokens with exportTokenToFile(), then point GARMIN_TOKEN_DIR at that folder.'
+    );
+  }
+  return null;
+}
+
+// Returns { oauth1, oauth2, source, dir|null }
+function loadTokens() {
+  const oauth1 = parseTokenEnv('GARMIN_OAUTH1_TOKEN');
+  const oauth2 = parseTokenEnv('GARMIN_OAUTH2_TOKEN');
+  if (oauth1 && oauth2) return { oauth1, oauth2, source: 'environment variables', dir: null };
+  if (oauth1 || oauth2) {
+    throw new SetupError('Set BOTH GARMIN_OAUTH1_TOKEN and GARMIN_OAUTH2_TOKEN (only one was found).');
+  }
+  const dir = findTokenDir();
+  if (!dir) {
+    throw new SetupError(
+      'No cached Garmin tokens found. On Hostinger, set GARMIN_OAUTH1_TOKEN and GARMIN_OAUTH2_TOKEN ' +
+      'as environment variables (run `node dashboard.js --print-token-env` on your own computer to get ' +
+      `the values). Locally, keep them in one of: ${TOKEN_DIR_CANDIDATES.join(', ')}.`
+    );
+  }
+  const read = (f) => JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+  return { oauth1: read('oauth1_token.json'), oauth2: read('oauth2_token.json'), source: dir, dir };
+}
+
+let cachedClient = null;
+
 async function getClient() {
-  checkTokenStore();
-  const client = new GarminConnect({});
+  if (cachedClient) return cachedClient;
+  const tokens = loadTokens();
+  // The constructor only requires a truthy credentials object; no password is used.
+  const client = new GarminConnect({ username: '', password: '' }, GARMIN_DOMAIN);
+  client.loadToken(tokens.oauth1, tokens.oauth2);
   try {
-    client.loadTokenByFile(TOKENSTORE);
-    // Confirm the token actually works before we build the whole page on it.
+    // Confirm the token works (this also refreshes an expired OAuth2 token via OAuth1).
     await client.getUserProfile();
   } catch (e) {
-    console.error(
-      `Could not resume the cached Garmin session (${e.name || 'Error'}: ${e.message}).\n` +
-      'Your cached tokens have likely expired. Re-authenticate once via the ' +
-      'normal login flow to refresh the token cache, then re-run this script.'
+    throw new SetupError(
+      `Could not resume the cached Garmin session (${e.name || 'Error'}: ${e.message}). ` +
+      'The tokens have likely expired. Log in once on your own computer to refresh them, then update ' +
+      'the token files / environment variables.'
     );
-    process.exit(1);
   }
+  // Persist a refreshed OAuth2 token back to disk when the tokens came from a folder.
+  if (tokens.dir) {
+    try { client.exportTokenToFile(tokens.dir); } catch (_) { /* read-only disk is fine */ }
+  }
+  console.log(`Garmin session ready (tokens from ${tokens.source}).`);
+  cachedClient = client;
   return client;
 }
 
-// Best-effort raw GET against the Garmin Connect proxy, working around the
-// fact that garmin-connect's exact "custom request" method name has moved
-// around between versions.
+// Raw GET against the Garmin Connect API. garmin-connect's get() passes the
+// URL straight to axios with no base URL, so paths must be made absolute.
 async function raw(client, urlPath) {
-  if (typeof client.get === 'function') return client.get(urlPath);
-  if (client.client && typeof client.client.get === 'function') return client.client.get(urlPath);
+  const base = (client.url && client.url.GC_API) || `https://connectapi.${GARMIN_DOMAIN}`;
+  const url = urlPath.startsWith('http') ? urlPath : base + urlPath;
+  if (typeof client.get === 'function') return client.get(url);
+  if (client.client && typeof client.client.get === 'function') return client.client.get(url);
   throw new Error('no raw GET method found on GarminConnect client');
 }
 
@@ -436,21 +481,16 @@ function fmtDate(d) {
   return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: '2-digit' });
 }
 
-// =============================================================================
-// Render
-// =============================================================================
-function renderHtml(ctx) {
-  let html = HTML_TEMPLATE;
-  for (const [token, value] of Object.entries(ctx)) {
-    html = html.split(token).join(value);
-  }
-  fs.writeFileSync(OUTPUT_FILE, html);
-}
 
+// =============================================================================
+// Build page context
+// =============================================================================
 async function buildContext(client) {
+  resetDiagnostics();
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const raceDate = new Date(CONFIG.raceDate + 'T00:00:00');
+  if (isNaN(raceDate)) throw new SetupError(`RACE_DATE must be YYYY-MM-DD (got "${CONFIG.raceDate}").`);
   const daysLeft = Math.round((raceDate - today) / 86400000);
   const weeksLeft = Math.floor(daysLeft / 7);
 
@@ -506,7 +546,7 @@ async function buildContext(client) {
   if (!runsRows) runsRows = '<tr><td colspan="5" class="empty">No runs found in this window.</td></tr>';
 
   const pbsHtml = Object.entries(CONFIG.personalBests)
-    .map(([k, v]) => `<div class="pb"><span class="pb-dist">${k}</span><span class="pb-time">${v}</span></div>`)
+    .map(([k, v]) => `<div class="pb"><span class="pb-dist">${escapeHtml(k)}</span><span class="pb-time">${escapeHtml(v)}</span></div>`)
     .join('');
 
   const currentCtl = ctlD.length ? ctlD[ctlD.length - 1] : 0;
@@ -515,7 +555,7 @@ async function buildContext(client) {
 
   let diagnosticsHtml = '';
   if (DIAGNOSTICS.missing.size) {
-    const items = [...DIAGNOSTICS.missing].sort().map((m) => `<li>${m}</li>`).join('');
+    const items = [...DIAGNOSTICS.missing].sort().map((m) => `<li>${escapeHtml(m)}</li>`).join('');
     diagnosticsHtml =
       `<details class="diagnostics"><summary>Fields unavailable this run (${DIAGNOSTICS.missing.size})</summary><ul>${items}</ul></details>`;
   }
@@ -523,8 +563,8 @@ async function buildContext(client) {
   const raceDateDisplay = raceDate.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
 
   return {
-    __RACE_NAME__: CONFIG.raceName,
-    __RACE_DATE_DISPLAY__: raceDateDisplay,
+    __RACE_NAME__: escapeHtml(CONFIG.raceName),
+    __RACE_DATE_DISPLAY__: escapeHtml(raceDateDisplay),
     __DAYS_LEFT__: String(Math.max(daysLeft, 0)),
     __WEEKS_LEFT__: String(Math.max(weeksLeft, 0)),
     __HEIGHT_WEIGHT__: `${CONFIG.heightCm} cm &middot; ${CONFIG.weightKg} kg`,
@@ -554,30 +594,177 @@ async function buildContext(client) {
     __EASY_BASELINE__: easyPaceBaseline ? fmtPace(easyPaceBaseline) : '—',
     __RUNS_ROWS__: runsRows,
     __DIAGNOSTICS_HTML__: diagnosticsHtml,
-    __GENERATED_AT__: new Date().toISOString().slice(0, 16).replace('T', ' '),
+    __GENERATED_AT__: new Date().toISOString().slice(0, 16).replace('T', ' ') + ' UTC',
   };
 }
 
-async function main() {
-  console.log('Connecting to Garmin using cached tokens...');
+// =============================================================================
+// Render / build
+// =============================================================================
+function renderHtml(ctx) {
+  let html = HTML_TEMPLATE;
+  for (const [token, value] of Object.entries(ctx)) {
+    html = html.split(token).join(value);
+  }
+  return html;
+}
+
+async function buildDashboard() {
   const client = await getClient();
-  console.log('Connected. Pulling data (this can take a minute for daily recovery metrics)...');
+  try {
+    const ctx = await buildContext(client);
+    return renderHtml(ctx);
+  } catch (e) {
+    // If the session died mid-build, force a fresh token load next time.
+    if (e && /401|403|unauthori[sz]ed/i.test(String(e.message))) cachedClient = null;
+    throw e;
+  }
+}
 
-  const ctx = await buildContext(client);
-  renderHtml(ctx);
+function statusPage(title, message, autoRefreshSeconds) {
+  const refresh = autoRefreshSeconds ? `<meta http-equiv="refresh" content="${autoRefreshSeconds}">` : '';
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">${refresh}
+<title>${escapeHtml(title)}</title>
+<style>body{margin:0;background:#12151B;color:#EDEFF3;font-family:system-ui,sans-serif;line-height:1.55}
+.wrap{max-width:640px;margin:12vh auto;padding:0 24px}h1{font-size:22px;font-weight:600}
+p{color:#8A90A0;white-space:pre-wrap}</style></head>
+<body><div class="wrap"><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p></div></body></html>`;
+}
 
+// =============================================================================
+// Web server (Hostinger Node.js app mode)
+// =============================================================================
+const state = { html: null, builtAt: null, lastError: null, building: null };
+
+function rebuild() {
+  if (state.building) return state.building;
+  console.log(`[${new Date().toISOString()}] Building dashboard...`);
+  state.building = buildDashboard()
+    .then((html) => {
+      state.html = html;
+      state.builtAt = new Date();
+      state.lastError = null;
+      console.log(`[${new Date().toISOString()}] Dashboard built. OK: ${DIAGNOSTICS.ok.size}, unavailable: ${DIAGNOSTICS.missing.size}`);
+    })
+    .catch((e) => {
+      state.lastError = e instanceof SetupError ? e.message : `${e.name || 'Error'}: ${e.message}`;
+      console.error(`[${new Date().toISOString()}] Build failed: ${state.lastError}`);
+    })
+    .finally(() => { state.building = null; });
+  return state.building;
+}
+
+function isAuthorized(req) {
+  if (!DASHBOARD_PASSWORD) return true;
+  const header = req.headers.authorization || '';
+  if (!header.startsWith('Basic ')) return false;
+  const [user, ...rest] = Buffer.from(header.slice(6), 'base64').toString('utf8').split(':');
+  const pass = rest.join(':');
+  const a = crypto.createHash('sha256').update(`${user}:${pass}`).digest();
+  const b = crypto.createHash('sha256').update(`${DASHBOARD_USER}:${DASHBOARD_PASSWORD}`).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+function send(res, status, body, type = 'text/html; charset=utf-8', extra = {}) {
+  res.writeHead(status, {
+    'Content-Type': type,
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+    'X-Robots-Tag': 'noindex, nofollow',
+    ...extra,
+  });
+  res.end(body);
+}
+
+function startServer() {
+  if (!DASHBOARD_PASSWORD) {
+    console.warn('WARNING: DASHBOARD_PASSWORD is not set, so your health data is publicly visible. ' +
+      'Set it in your environment variables to require a login.');
+  }
+
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+
+    if (url.pathname === '/health') {
+      // Kept minimal on purpose: this endpoint is public, so no error details here.
+      return send(res, 200, JSON.stringify({ ok: true, ready: !!state.html }), 'application/json');
+    }
+    if (url.pathname === '/robots.txt') {
+      return send(res, 200, 'User-agent: *\nDisallow: /\n', 'text/plain');
+    }
+
+    if (!isAuthorized(req)) {
+      return send(res, 401, 'Login required', 'text/plain', { 'WWW-Authenticate': 'Basic realm="Training Dashboard"' });
+    }
+
+    if (url.pathname === '/refresh') {
+      rebuild();
+      res.writeHead(303, { Location: '/' });
+      return res.end();
+    }
+
+    if (url.pathname === '/' || url.pathname === '/index.html') {
+      if (state.html) return send(res, 200, state.html);
+      if (state.building) {
+        return send(res, 200, statusPage('Building your dashboard…',
+          'Pulling data from Garmin Connect. The first build can take a minute or two; this page reloads itself.', 10));
+      }
+      return send(res, 503, statusPage('Dashboard unavailable',
+        `${state.lastError || 'Not built yet.'}\n\nFix the problem, then open /refresh to try again.`));
+    }
+
+    send(res, 404, 'Not found', 'text/plain');
+  });
+
+  server.listen(PORT, () => {
+    console.log(`Training dashboard listening on port ${PORT} (refresh every ${REFRESH_MINUTES} min).`);
+    rebuild();
+    setInterval(rebuild, REFRESH_MINUTES * 60 * 1000).unref();
+  });
+
+  const shutdown = () => server.close(() => process.exit(0));
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+}
+
+// =============================================================================
+// CLI modes
+// =============================================================================
+async function buildStatic() {
+  console.log('Connecting to Garmin using cached tokens...');
+  console.log('Pulling data (this can take a minute for daily recovery metrics)...');
+  const html = await buildDashboard();
+  fs.writeFileSync(OUTPUT_FILE, html);
   console.log(`\nWrote ${OUTPUT_FILE}`);
   console.log(`Fields returned OK: ${DIAGNOSTICS.ok.size}`);
   if (DIAGNOSTICS.missing.size) {
     console.log(`Fields unavailable/empty: ${DIAGNOSTICS.missing.size} (see the page footer for the list)`);
   }
-  console.log('Open index.html in your browser. Re-run this script any time to refresh.');
 }
 
-main().catch((e) => {
-  console.error('Unexpected error:', e);
-  process.exit(1);
-});
+function printTokenEnv() {
+  const tokens = loadTokens();
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64');
+  console.log(`# From ${tokens.source}. Paste these into Hostinger's environment variables.`);
+  console.log('# Treat them like a password: they give access to your Garmin account.');
+  console.log(`GARMIN_OAUTH1_TOKEN=${b64(tokens.oauth1)}`);
+  console.log(`GARMIN_OAUTH2_TOKEN=${b64(tokens.oauth2)}`);
+}
+
+function run() {
+  const args = process.argv.slice(2);
+  const fail = (e) => {
+    console.error(e instanceof SetupError ? e.message : e);
+    process.exit(1);
+  };
+  if (args.includes('--build')) return buildStatic().catch(fail);
+  if (args.includes('--print-token-env')) {
+    try { return printTokenEnv(); } catch (e) { return fail(e); }
+  }
+  return startServer();
+}
 
 // =============================================================================
 // HTML template — dark, data-dense "performance lab" layout.
@@ -744,7 +931,7 @@ __RUNS_ROWS__
 
   __DIAGNOSTICS_HTML__
 
-  <footer>Generated __GENERATED_AT__ from your Garmin Connect data. Re-run dashboard.js to refresh.</footer>
+  <footer>Generated __GENERATED_AT__ from your Garmin Connect data. Refreshes automatically.</footer>
 </div>
 
 <script>
@@ -850,3 +1037,6 @@ new Chart(document.getElementById('vo2Chart'), {
 </body>
 </html>
 `;
+
+// Entry point — runs after HTML_TEMPLATE is defined.
+run();

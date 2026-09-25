@@ -1,0 +1,4 @@
+node_modules/
+.garminconnect/
+index.html
+.env

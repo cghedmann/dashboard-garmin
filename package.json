@@ -1,4 +1,17 @@
 {
+  "name": "garmin-training-dashboard",
+  "version": "1.0.0",
+  "description": "Garmin Connect training dashboard (CTL/ATL/TSB, mileage, recovery, pace, VO2max)",
+  "main": "dashboard.js",
+  "private": true,
+  "scripts": {
+    "start": "node dashboard.js",
+    "static": "node dashboard.js --build",
+    "tokens": "node dashboard.js --print-token-env"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "garmin-connect": "^1.6.2"
   }
