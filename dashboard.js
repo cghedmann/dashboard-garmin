@@ -5,17 +5,18 @@
  *
  *   1. Deploy to Hostinger (hPanel → Add Website → Node.js web app). No
  *      environment variables are required.
- *   2. Open the site. The first visit shows /setup: enter the SETUP CODE from
- *      hPanel → your app → Runtime Logs, create your dashboard login and add
- *      your race.
- *   3. Sign in to Garmin on the /login page (password used once, never stored).
- *   4. Change race, PBs, units, refresh interval or password on /settings.
+ *   2. Open the site and sign in to Garmin (/login). Your Garmin password is
+ *      used once and never stored.
+ *   3. Add your race, PBs, units, timezone and refresh interval on /settings.
+ *
+ * There is no dashboard login: anyone with the link can view the dashboard
+ * and use the Settings and Garmin pages.
  *
  * The page refreshes from Garmin every few minutes (default 10). Past days are
  * cached in ~/.garmin-dashboard, so a refresh only re-downloads the last couple
  * of days, and redeploys keep your settings, Garmin sign-in and data.
  *
- * Optional extras: env vars (RACE_NAME, DASHBOARD_PASSWORD, GARMIN_OAUTH1_TOKEN,
+ * Optional extras: env vars (RACE_NAME, GARMIN_OAUTH1_TOKEN,
  * ...) still work, and `node dashboard.js --build | --login | --print-token-env`
  * are available if you ever run it on a computer. None are needed on Hostinger.
  *
@@ -77,9 +78,6 @@ const WEEKS_RECENT_RUNS = 4;    // recent runs table + pace panel window
 
 const PORT = Number(env.PORT) || 3000;
 const MIN_MANUAL_REFRESH_SECONDS = 30;
-// Optional: if set, these override the password created on the /setup page.
-const ENV_DASHBOARD_USER = env.DASHBOARD_USER || 'runner';
-const ENV_DASHBOARD_PASSWORD = env.DASHBOARD_PASSWORD || '';
 const GARMIN_DOMAIN = env.GARMIN_DOMAIN === 'garmin.cn' ? 'garmin.cn' : 'garmin.com';
 
 const TOKEN_DIR_CANDIDATES = [
@@ -929,69 +927,6 @@ function readBody(req, limit = 16 * 1024) {
 }
 
 // =============================================================================
-// Dashboard login (the password protecting this site)
-// =============================================================================
-function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
-  return { salt, hash: crypto.scryptSync(password, salt, 32).toString('hex') };
-}
-
-function authMode() {
-  if (ENV_DASHBOARD_PASSWORD) return 'env';
-  if (SETTINGS.auth && SETTINGS.auth.hash) return 'settings';
-  return 'setup';
-}
-
-function credentialsMatch(user, pass) {
-  const mode = authMode();
-  if (mode === 'env') {
-    const a = crypto.createHash('sha256').update(`${user}:${pass}`).digest();
-    const b = crypto.createHash('sha256').update(`${ENV_DASHBOARD_USER}:${ENV_DASHBOARD_PASSWORD}`).digest();
-    return crypto.timingSafeEqual(a, b);
-  }
-  if (mode === 'settings') {
-    const { user: u, salt, hash } = SETTINGS.auth;
-    const got = Buffer.from(hashPassword(pass, salt).hash, 'hex');
-    return crypto.timingSafeEqual(got, Buffer.from(hash, 'hex')) && user === u;
-  }
-  return false;
-}
-
-// Remember the last accepted Authorization header so scrypt isn't re-run on every request.
-let acceptedAuthHeader = null;
-
-// Slow down password guessing: 10 failures per IP per 15 minutes.
-const failures = new Map();
-function clientIp(req) {
-  return String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || '?';
-}
-function isLockedOut(req) {
-  const f = failures.get(clientIp(req));
-  return !!(f && f.count >= 10 && f.resetAt > Date.now());
-}
-function noteFailure(req) {
-  const ip = clientIp(req);
-  const now = Date.now();
-  const f = failures.get(ip);
-  if (!f || f.resetAt < now) failures.set(ip, { count: 1, resetAt: now + 15 * 60 * 1000 });
-  else f.count += 1;
-  if (failures.size > 5000) failures.clear();
-}
-
-function isAuthorized(req) {
-  const header = req.headers.authorization || '';
-  if (!header.startsWith('Basic ')) return false;
-  if (acceptedAuthHeader && header === acceptedAuthHeader) return true;
-  const [user, ...rest] = Buffer.from(header.slice(6), 'base64').toString('utf8').split(':');
-  const ok = credentialsMatch(user, rest.join(':'));
-  if (ok) acceptedAuthHeader = header;
-  else noteFailure(req);
-  return ok;
-}
-
-// One-time code printed in the Runtime Logs, so only the site owner can do first-time setup.
-const SETUP_CODE = String(crypto.randomInt(0, 100000000)).padStart(8, '0').replace(/(\d{4})(\d{4})/, '$1-$2');
-
-// =============================================================================
 // Settings form handling
 // =============================================================================
 function validateConfig(form) {
@@ -1021,21 +956,11 @@ function validateConfig(form) {
   return { config: c, errors };
 }
 
-function validateNewPassword(form, required) {
-  const user = (form.get('username') || '').trim();
-  const pw = form.get('password') || '';
-  const pw2 = form.get('password2') || '';
-  if (!required && !pw && !pw2) return { skip: true };
-  if (!user || user.includes(':') || user.length > 64) return { error: 'Choose a username (no colons).' };
-  if (pw.length < 10) return { error: 'Use a password of at least 10 characters.' };
-  if (pw !== pw2) return { error: "The two passwords don't match." };
-  return { user, pw };
-}
-
 function applyConfigChange(newConfig) {
   const unitsChanged = newConfig.units !== CONFIG.units;
   const refreshChanged = newConfig.refreshMinutes != null && newConfig.refreshMinutes !== CONFIG.refreshMinutes;
   SETTINGS.config = { ...(SETTINGS.config || {}), ...newConfig };
+  delete SETTINGS.auth; // left over from versions that had a dashboard login
   saveSettings();
   loadSettings();
   if (unitsChanged) clearCache(); // cached paces are stored in the old unit
@@ -1077,28 +1002,6 @@ function configFields(full) {
   return html;
 }
 
-function setupPage(error = '') {
-  return page('Set up your dashboard', `
-<h1>Set up your training dashboard</h1>
-<p>Create the login that protects this site, then add your race. You can change all of this later on the Settings page.</p>
-${msgHtml(error)}
-<form method="post" action="/setup">
-${csrfField()}
-<label for="code">Setup code</label>
-<input id="code" name="code" required autocomplete="off" placeholder="1234-5678">
-<p class="note">Find it in hPanel: your Node.js app → Runtime Logs, on the line starting <code>SETUP CODE</code>. It changes every time the app restarts.</p>
-<h2>Your dashboard login</h2>
-<label for="username">Username</label><input id="username" name="username" required value="runner" autocomplete="username">
-<div class="row">
-<div><label for="password">Password</label><input id="password" name="password" type="password" required minlength="10" autocomplete="new-password"></div>
-<div><label for="password2">Password again</label><input id="password2" name="password2" type="password" required minlength="10" autocomplete="new-password"></div>
-</div>
-<h2>Your race</h2>
-${configFields(false)}
-<button type="submit">Save and continue</button>
-</form>`);
-}
-
 function garminStatus() {
   try {
     const t = loadTokens();
@@ -1110,21 +1013,12 @@ function garminStatus() {
 
 function settingsPage(error = '', ok = '') {
   const g = garminStatus();
-  const envAuth = authMode() === 'env';
   const garminHtml = g.connected
     ? `<p>Connected.${g.fromEnv ? ' (Using tokens from environment variables; remove them in hPanel to disconnect.)' : ''}</p>
 <a class="btn btn-quiet" href="/login">Sign in again</a>
 ${g.fromEnv ? '' : `<form method="post" action="/settings/disconnect" style="display:inline">${csrfField()}
 <button class="btn-danger" type="submit" onclick="return confirm('Disconnect Garmin and delete the downloaded data?')">Disconnect Garmin</button></form>`}`
     : '<p>Not connected.</p><a class="btn" href="/login">Sign in to Garmin</a>';
-  const pwHtml = envAuth
-    ? '<p class="note">Your login is set by the DASHBOARD_PASSWORD environment variable, so it can only be changed in hPanel.</p>'
-    : `<p class="note">Leave blank to keep your current password. You'll be asked to log in again after changing it.</p>
-<label for="username">Username</label><input id="username" name="username" value="${escapeHtml((SETTINGS.auth || {}).user || '')}" autocomplete="username">
-<div class="row">
-<div><label for="password">New password</label><input id="password" name="password" type="password" minlength="10" autocomplete="new-password"></div>
-<div><label for="password2">New password again</label><input id="password2" name="password2" type="password" minlength="10" autocomplete="new-password"></div>
-</div>`;
   return page('Settings', `
 <p><a href="/">← Back to dashboard</a></p>
 <h1>Settings</h1>
@@ -1132,8 +1026,6 @@ ${msgHtml(error, ok)}
 <form method="post" action="/settings">
 ${csrfField()}
 ${configFields(true)}
-<h2>Dashboard login</h2>
-${pwHtml}
 <button type="submit">Save settings</button>
 </form>
 <h2>Garmin account</h2>
@@ -1178,7 +1070,7 @@ async function handleLoginPost(req, res, form) {
     loginGuard.failures = 0;
     state.lastError = null;
     rebuild({ queue: true });
-    return redirect(res, '/');
+    return redirect(res, SETTINGS.config ? '/' : '/settings?welcome=1');
   } catch (e) {
     loginGuard.failures += 1;
     if (loginGuard.failures >= 5) {
@@ -1280,8 +1172,6 @@ async function handleRequest(req, res) {
   }
   if (route === '/robots.txt') return send(res, 200, 'User-agent: *\nDisallow: /\n', 'text/plain');
 
-  if (isLockedOut(req)) return send(res, 429, 'Too many failed attempts. Try again in 15 minutes.', 'text/plain');
-
   let form = null;
   if (isPost) {
     try {
@@ -1294,31 +1184,7 @@ async function handleRequest(req, res) {
     }
   }
 
-  // ---- First-time setup (no dashboard password yet) ----
-  if (authMode() === 'setup') {
-    if (route !== '/setup') return redirect(res, '/setup');
-    if (!isPost) return send(res, 200, setupPage());
-    const code = (form.get('code') || '').replace(/\s/g, '');
-    if (code.replace('-', '') !== SETUP_CODE.replace('-', '')) {
-      noteFailure(req);
-      return send(res, 403, setupPage("That setup code isn't right. Copy it from the Runtime Logs in hPanel."));
-    }
-    const pw = validateNewPassword(form, true);
-    if (pw.error) return send(res, 400, setupPage(pw.error));
-    const { config, errors } = validateConfig(form);
-    if (errors.length) return send(res, 400, setupPage(errors.join(' ')));
-    SETTINGS.auth = { user: pw.user, ...hashPassword(pw.pw) };
-    applyConfigChange(config); // also saves SETTINGS.auth
-    acceptedAuthHeader = null;
-    console.log('Setup complete: dashboard login created.');
-    return redirect(res, garminStatus().connected ? '/' : '/login');
-  }
   if (route === '/setup') return redirect(res, '/');
-
-  // ---- Everything below needs the dashboard login ----
-  if (!isAuthorized(req)) {
-    return send(res, 401, 'Login required', 'text/plain', { 'WWW-Authenticate': 'Basic realm="Training Dashboard", charset="UTF-8"' });
-  }
 
   if (route === '/login') {
     if (isPost) return handleLoginPost(req, res, form);
@@ -1326,19 +1192,14 @@ async function handleRequest(req, res) {
   }
 
   if (route === '/settings') {
-    if (!isPost) return send(res, 200, settingsPage());
-    const { config, errors } = validateConfig(form);
-    let pw = { skip: true };
-    if (authMode() === 'settings') pw = validateNewPassword(form, false);
-    if (errors.length || pw.error) return send(res, 400, settingsPage([...errors, pw.error].filter(Boolean).join(' ')));
-    if (!pw.skip) {
-      SETTINGS.auth = { user: pw.user, ...hashPassword(pw.pw) };
-      acceptedAuthHeader = null;
+    if (!isPost) {
+      return send(res, 200, settingsPage('', url.searchParams.has('welcome')
+        ? 'Garmin connected. Add your race below, then save.' : ''));
     }
+    const { config, errors } = validateConfig(form);
+    if (errors.length) return send(res, 400, settingsPage(errors.join(' ')));
     applyConfigChange(config);
-    return send(res, 200, settingsPage('', pw.skip
-      ? 'Saved. The dashboard is rebuilding with your changes.'
-      : 'Saved. Your browser will ask for the new password next time you load a page.'));
+    return send(res, 200, settingsPage('', 'Saved. The dashboard is rebuilding with your changes.'));
   }
 
   if (route === '/settings/disconnect' && isPost) {
@@ -1380,12 +1241,6 @@ function startServer() {
 
   server.listen(PORT, () => {
     console.log(`Training dashboard listening on port ${PORT} (refresh every ${CONFIG.refreshMinutes} min).`);
-    if (authMode() === 'setup') {
-      console.log('============================================================');
-      console.log(`SETUP CODE: ${SETUP_CODE}`);
-      console.log('Open your site and enter this code to create your login.');
-      console.log('============================================================');
-    }
     rebuild();
     scheduleRefresh();
   });
