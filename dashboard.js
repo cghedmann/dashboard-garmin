@@ -13,16 +13,20 @@
  *   node dashboard.js --build     One-off: write index.html next to this file
  *                                 (the original behaviour; upload that file to
  *                                 static hosting if you prefer).
+ *   node dashboard.js --login     Sign in to Garmin with email + password and
+ *                                 save OAuth tokens (then prints them as env
+ *                                 values for Hostinger). Or open /login on the
+ *                                 running site (needs DASHBOARD_PASSWORD set).
  *   node dashboard.js --print-token-env
  *                                 Print your local cached tokens as two env
  *                                 values to paste into Hostinger's hPanel.
  *
  * TOKENS (checked in this order)
  * ------------------------------
- *   1. GARMIN_OAUTH1_TOKEN + GARMIN_OAUTH2_TOKEN env vars (JSON or base64 JSON)
- *   2. GARMIN_TOKEN_DIR env var (folder with oauth1_token.json/oauth2_token.json)
- *   3. ./.garminconnect next to this file
- *   4. ~/.garminconnect
+ *   1. GARMIN_TOKEN_DIR env var (folder with oauth1_token.json/oauth2_token.json)
+ *   2. ./.garminconnect next to this file
+ *   3. ~/.garminconnect  (where --login and /login save by default)
+ *   4. GARMIN_OAUTH1_TOKEN + GARMIN_OAUTH2_TOKEN env vars (JSON or base64 JSON)
  *
  * The `garmin-connect` npm package only has built-in methods for profile and
  * activities. HRV, resting HR, sleep and VO2max come from undocumented Garmin
@@ -37,6 +41,7 @@ const path = require('path');
 const os = require('os');
 const http = require('http');
 const crypto = require('crypto');
+const readline = require('readline');
 
 let GarminConnect;
 try {
@@ -81,6 +86,9 @@ const TOKEN_DIR_CANDIDATES = [
   path.join(__dirname, '.garminconnect'),
   path.join(os.homedir(), '.garminconnect'),
 ].filter(Boolean);
+// Where --login and the /login page save tokens. The home folder survives
+// Hostinger redeploys (the app folder is replaced on every build).
+const TOKEN_SAVE_DIR = env.GARMIN_TOKEN_DIR || path.join(os.homedir(), '.garminconnect');
 const OUTPUT_FILE = path.join(__dirname, 'index.html');
 
 const RUNNING_TYPES = new Set([
@@ -160,23 +168,65 @@ function findTokenDir() {
 }
 
 // Returns { oauth1, oauth2, source, dir|null }
+// Token files are checked before env vars so a fresh login (which writes files)
+// takes over from older tokens pasted into the environment.
 function loadTokens() {
+  const dir = findTokenDir();
+  if (dir) {
+    const read = (f) => JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
+    return { oauth1: read('oauth1_token.json'), oauth2: read('oauth2_token.json'), source: dir, dir };
+  }
   const oauth1 = parseTokenEnv('GARMIN_OAUTH1_TOKEN');
   const oauth2 = parseTokenEnv('GARMIN_OAUTH2_TOKEN');
   if (oauth1 && oauth2) return { oauth1, oauth2, source: 'environment variables', dir: null };
   if (oauth1 || oauth2) {
     throw new SetupError('Set BOTH GARMIN_OAUTH1_TOKEN and GARMIN_OAUTH2_TOKEN (only one was found).');
   }
-  const dir = findTokenDir();
-  if (!dir) {
-    throw new SetupError(
-      'No cached Garmin tokens found. On Hostinger, set GARMIN_OAUTH1_TOKEN and GARMIN_OAUTH2_TOKEN ' +
-      'as environment variables (run `node dashboard.js --print-token-env` on your own computer to get ' +
-      `the values). Locally, keep them in one of: ${TOKEN_DIR_CANDIDATES.join(', ')}.`
-    );
+  throw new SetupError(
+    'No Garmin tokens yet. Open /login on this site to sign in to Garmin, or run ' +
+    '`npm run login` on your own computer.'
+  );
+}
+
+// =============================================================================
+// Garmin login — exchanges email + password for OAuth tokens and saves them.
+// The password is used once and never stored or logged.
+// Note: the garmin-connect package can't complete two-step verification (MFA).
+// =============================================================================
+function saveTokens(dir, tokens) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const write = (f, data) =>
+    fs.writeFileSync(path.join(dir, f), JSON.stringify(data, null, 2), { mode: 0o600 });
+  write('oauth1_token.json', tokens.oauth1);
+  write('oauth2_token.json', tokens.oauth2);
+}
+
+async function loginToGarmin(email, password) {
+  if (!email || !password) throw new SetupError('Enter your Garmin email and password.');
+  const client = new GarminConnect({ username: email, password }, GARMIN_DOMAIN);
+  try {
+    await client.login();
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    if (/ticket not found|mfa/i.test(msg)) {
+      throw new SetupError(
+        'Garmin rejected the login. Check your email and password. If your account uses two-step ' +
+        'verification, this login can\'t complete it; turn it off, log in, then turn it back on.'
+      );
+    }
+    if (/429|too many/i.test(msg)) {
+      throw new SetupError('Garmin is rate-limiting logins from this server. Wait an hour and try again, or run `npm run login` on your own computer.');
+    }
+    if (/403|cloudflare/i.test(msg)) {
+      throw new SetupError('Garmin blocked the login request from this server. Run `npm run login` on your own computer instead and paste the printed values into your environment variables.');
+    }
+    throw new SetupError(`Garmin login failed: ${msg.slice(0, 200)}`);
   }
-  const read = (f) => JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'));
-  return { oauth1: read('oauth1_token.json'), oauth2: read('oauth2_token.json'), source: dir, dir };
+  const tokens = client.exportToken();
+  saveTokens(TOKEN_SAVE_DIR, tokens);
+  cachedClient = client; // use the new session straight away
+  console.log(`Garmin login OK. Tokens saved to ${TOKEN_SAVE_DIR}.`);
+  return tokens;
 }
 
 let cachedClient = null;
@@ -193,8 +243,7 @@ async function getClient() {
   } catch (e) {
     throw new SetupError(
       `Could not resume the cached Garmin session (${e.name || 'Error'}: ${e.message}). ` +
-      'The tokens have likely expired. Log in once on your own computer to refresh them, then update ' +
-      'the token files / environment variables.'
+      'The tokens have likely expired. Open /login on this site (or run `npm run login`) to sign in again.'
     );
   }
   // Persist a refreshed OAuth2 token back to disk when the tokens came from a folder.
@@ -621,15 +670,102 @@ async function buildDashboard() {
   }
 }
 
-function statusPage(title, message, autoRefreshSeconds) {
+const PAGE_STYLE = `body{margin:0;background:#12151B;color:#EDEFF3;font-family:system-ui,sans-serif;line-height:1.55}
+.wrap{max-width:640px;margin:12vh auto;padding:0 24px}h1{font-size:22px;font-weight:600}
+p{color:#8A90A0;white-space:pre-wrap}a{color:#6E86FF}
+label{display:block;margin:16px 0 6px;font-size:14px;color:#8A90A0}
+input{width:100%;box-sizing:border-box;padding:10px 12px;border-radius:8px;border:1px solid #2A2F3A;background:#1A1E26;color:#EDEFF3;font-size:16px}
+button,.btn{display:inline-block;margin-top:20px;padding:10px 18px;border:0;border-radius:8px;background:#6E86FF;color:#fff;font-size:15px;font-weight:600;cursor:pointer;text-decoration:none}
+.err{color:#E94F64;background:#2a1a1f;border-radius:8px;padding:10px 12px}.note{font-size:13px}`;
+
+function statusPage(title, message, autoRefreshSeconds, actionsHtml = '') {
   const refresh = autoRefreshSeconds ? `<meta http-equiv="refresh" content="${autoRefreshSeconds}">` : '';
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">${refresh}
 <title>${escapeHtml(title)}</title>
-<style>body{margin:0;background:#12151B;color:#EDEFF3;font-family:system-ui,sans-serif;line-height:1.55}
-.wrap{max-width:640px;margin:12vh auto;padding:0 24px}h1{font-size:22px;font-weight:600}
-p{color:#8A90A0;white-space:pre-wrap}</style></head>
-<body><div class="wrap"><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p></div></body></html>`;
+<style>${PAGE_STYLE}</style></head>
+<body><div class="wrap"><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p>${actionsHtml}</div></body></html>`;
+}
+
+// Per-process token embedded in the login form, so other sites can't submit it
+// using your cached dashboard login (CSRF protection).
+const LOGIN_FORM_TOKEN = crypto.randomBytes(24).toString('hex');
+const loginGuard = { inFlight: false, failures: 0, lockedUntil: 0 };
+
+function loginPage(errorMessage = '', email = '') {
+  const err = errorMessage ? `<p class="err">${escapeHtml(errorMessage)}</p>` : '';
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Connect Garmin</title>
+<style>${PAGE_STYLE}</style></head><body><div class="wrap">
+<h1>Connect your Garmin account</h1>
+<p>Your password is sent to Garmin once to get access tokens, then discarded. It is never stored.</p>
+${err}
+<form method="post" action="/login" autocomplete="on">
+<input type="hidden" name="csrf" value="${LOGIN_FORM_TOKEN}">
+<label for="email">Garmin email</label>
+<input id="email" name="email" type="email" required autocomplete="username" value="${escapeHtml(email)}">
+<label for="password">Garmin password</label>
+<input id="password" name="password" type="password" required autocomplete="current-password">
+<button type="submit">Sign in</button>
+</form>
+<p class="note">Two-step verification isn't supported by the Garmin library this app uses. If your account has it on, turn it off while you sign in, then turn it back on. The tokens keep working afterwards.</p>
+</div></body></html>`;
+}
+
+function readBody(req, limit = 10 * 1024) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+      if (body.length > limit) { reject(new Error('Request too large')); req.destroy(); }
+    });
+    req.on('end', () => resolve(body));
+    req.on('error', reject);
+  });
+}
+
+async function handleLoginPost(req, res) {
+  const now = Date.now();
+  if (loginGuard.lockedUntil > now) {
+    const mins = Math.ceil((loginGuard.lockedUntil - now) / 60000);
+    return send(res, 429, loginPage(`Too many failed attempts. Try again in ${mins} minute(s) so Garmin doesn't lock your account.`));
+  }
+  if (loginGuard.inFlight) return send(res, 429, loginPage('A sign-in is already in progress. Wait a moment.'));
+
+  let form;
+  try {
+    form = new URLSearchParams(await readBody(req));
+  } catch (e) {
+    return send(res, 413, loginPage('Request too large.'));
+  }
+  const csrf = form.get('csrf') || '';
+  if (csrf.length !== LOGIN_FORM_TOKEN.length ||
+      !crypto.timingSafeEqual(Buffer.from(csrf), Buffer.from(LOGIN_FORM_TOKEN))) {
+    return send(res, 403, loginPage('This form expired. Please try again.'));
+  }
+  const email = (form.get('email') || '').trim();
+  const password = form.get('password') || '';
+
+  loginGuard.inFlight = true;
+  try {
+    await loginToGarmin(email, password);
+    loginGuard.failures = 0;
+    state.lastError = null;
+    rebuild();
+    res.writeHead(303, { Location: '/' });
+    return res.end();
+  } catch (e) {
+    loginGuard.failures += 1;
+    if (loginGuard.failures >= 5) {
+      loginGuard.lockedUntil = Date.now() + 15 * 60 * 1000;
+      loginGuard.failures = 0;
+    }
+    const msg = e instanceof SetupError ? e.message : 'Sign-in failed unexpectedly. Check the Runtime Logs.';
+    if (!(e instanceof SetupError)) console.error('Login error:', e && e.message);
+    return send(res, 401, loginPage(msg, email));
+  } finally {
+    loginGuard.inFlight = false;
+  }
 }
 
 // =============================================================================
@@ -699,6 +835,22 @@ function startServer() {
       return send(res, 401, 'Login required', 'text/plain', { 'WWW-Authenticate': 'Basic realm="Training Dashboard"' });
     }
 
+    if (url.pathname === '/login') {
+      // Without a dashboard password anyone could swap in their own Garmin account.
+      if (!DASHBOARD_PASSWORD) {
+        return send(res, 403, statusPage('Garmin sign-in is disabled',
+          'Set DASHBOARD_PASSWORD in your environment variables and redeploy. The sign-in page only works when the site is password-protected.'));
+      }
+      if (req.method === 'POST') {
+        handleLoginPost(req, res).catch((e) => {
+          console.error('Login handler error:', e && e.message);
+          if (!res.headersSent) send(res, 500, loginPage('Something went wrong. Please try again.'));
+        });
+        return;
+      }
+      return send(res, 200, loginPage());
+    }
+
     if (url.pathname === '/refresh') {
       rebuild();
       res.writeHead(303, { Location: '/' });
@@ -712,7 +864,8 @@ function startServer() {
           'Pulling data from Garmin Connect. The first build can take a minute or two; this page reloads itself.', 10));
       }
       return send(res, 503, statusPage('Dashboard unavailable',
-        `${state.lastError || 'Not built yet.'}\n\nFix the problem, then open /refresh to try again.`));
+        state.lastError || 'Not built yet.', 0,
+        '<a class="btn" href="/login">Sign in to Garmin</a> &nbsp; <a href="/refresh">Try again</a>'));
     }
 
     send(res, 404, 'Not found', 'text/plain');
@@ -753,6 +906,34 @@ function printTokenEnv() {
   console.log(`GARMIN_OAUTH2_TOKEN=${b64(tokens.oauth2)}`);
 }
 
+function ask(question, { hidden = false } = {}) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+    if (hidden) {
+      // Echo the prompt but not the typed characters.
+      rl._writeToOutput = (text) => { if (text.includes(question)) rl.output.write(question); };
+    }
+    rl.question(question, (answer) => {
+      rl.close();
+      if (hidden) process.stdout.write('\n');
+      resolve(answer);
+    });
+  });
+}
+
+async function cliLogin() {
+  if (!process.stdin.isTTY) {
+    throw new SetupError('Run `npm run login` in an interactive terminal (it asks for your password).');
+  }
+  console.log('Sign in to Garmin Connect. Your password is used once and not saved.\n');
+  const email = (await ask('Garmin email: ')).trim();
+  const password = await ask('Garmin password: ', { hidden: true });
+  console.log('Signing in...');
+  await loginToGarmin(email, password);
+  console.log('\nTo use these tokens on Hostinger, add these environment variables:\n');
+  printTokenEnv();
+}
+
 function run() {
   const args = process.argv.slice(2);
   const fail = (e) => {
@@ -760,6 +941,7 @@ function run() {
     process.exit(1);
   };
   if (args.includes('--build')) return buildStatic().catch(fail);
+  if (args.includes('--login')) return cliLogin().catch(fail);
   if (args.includes('--print-token-env')) {
     try { return printTokenEnv(); } catch (e) { return fail(e); }
   }

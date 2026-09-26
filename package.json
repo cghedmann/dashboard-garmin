@@ -7,6 +7,7 @@
   "scripts": {
     "start": "node dashboard.js",
     "static": "node dashboard.js --build",
+    "login": "node dashboard.js --login",
     "tokens": "node dashboard.js --print-token-env"
   },
   "engines": {
