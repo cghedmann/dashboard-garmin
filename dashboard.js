@@ -1,24 +1,24 @@
 #!/usr/bin/env node
 /**
- * Training Dashboard — pulls your Garmin Connect data and shows it as a
- * self-contained dashboard website. Everything is done from the browser:
+ * Training Dashboard — pulls Garmin Connect data and shows it as a
+ * self-contained dashboard website. Several people can use it at once, each
+ * with their own Garmin account, settings and data. Everything is done from
+ * the browser:
  *
  *   1. Deploy to Hostinger (hPanel → Add Website → Node.js web app). No
  *      environment variables are required.
- *   2. Open the site and sign in to Garmin (/login). Your Garmin password is
- *      used once and never stored.
- *   3. Add your race, PBs, units, timezone and refresh interval on /settings.
+ *   2. Each person opens the site and signs in with their Garmin account.
+ *      That sign-in is also their login here; a cookie remembers them. Their
+ *      Garmin password is used once and never stored.
+ *   3. Each person sets their race, PBs, units, timezone and refresh interval
+ *      on /settings, and can sign out or delete their data there.
  *
- * There is no dashboard login: anyone with the link can view the dashboard
- * and use the Settings and Garmin pages.
+ * Per-user data lives in ~/.garmin-dashboard/users/<id>/ (outside the app
+ * folder, so redeploys keep it). Past days are cached, so a refresh only
+ * re-downloads the last couple of days. Builds run one user at a time.
  *
- * The page refreshes from Garmin every few minutes (default 10). Past days are
- * cached in ~/.garmin-dashboard, so a refresh only re-downloads the last couple
- * of days, and redeploys keep your settings, Garmin sign-in and data.
- *
- * Optional extras: env vars (RACE_NAME, GARMIN_OAUTH1_TOKEN,
- * ...) still work, and `node dashboard.js --build | --login | --print-token-env`
- * are available if you ever run it on a computer. None are needed on Hostinger.
+ * Optional extras for running on a computer (single user):
+ * `node dashboard.js --build | --login | --print-token-env`.
  *
  * HRV, resting HR, sleep and VO2max come from undocumented Garmin Connect
  * endpoints; every call is wrapped and failures are listed in the page footer.
@@ -46,7 +46,7 @@ try {
 // (saved to settings.json). Env vars also work and act as the starting values.
 // =============================================================================
 const env = process.env;
-const CONFIG = {
+let CONFIG = {
   raceName: env.RACE_NAME || 'REPLACE_ME Marathon',
   raceDate: env.RACE_DATE || '2026-12-31', // YYYY-MM-DD
   heightCm: Number(env.HEIGHT_CM) || 178,
@@ -93,7 +93,7 @@ const OUTPUT_FILE = path.join(__dirname, 'index.html');
 // folder, so Hostinger redeploys keep them.
 const DATA_DIR = env.DATA_DIR || path.join(os.homedir(), '.garmin-dashboard');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
-const CACHE_FILE = env.CACHE_FILE || path.join(DATA_DIR, 'cache.json');
+let CACHE_FILE = env.CACHE_FILE || path.join(DATA_DIR, 'cache.json'); // swapped per user during builds
 
 const RUNNING_TYPES = new Set([
   'running', 'track_running', 'trail_running', 'treadmill_running',
@@ -114,6 +114,8 @@ applyDerived();
 // Settings file — race/profile settings and the dashboard login, edited from
 // the website so nothing has to be changed in code or on another computer.
 // =============================================================================
+// Starting values for each new user (before any legacy single-user settings are applied).
+const DEFAULT_CONFIG = JSON.parse(JSON.stringify(CONFIG));
 let SETTINGS = {};
 const ORIGINAL_TZ = env.TZ || '';
 
@@ -267,18 +269,7 @@ async function loginToGarmin(email, password) {
     }
     throw new SetupError(`Garmin login failed: ${msg.slice(0, 200)}`);
   }
-  const tokens = client.exportToken();
-  saveTokens(TOKEN_SAVE_DIR, tokens);
-  // A different Garmin account means the cached data isn't yours any more.
-  try {
-    const profile = await client.getUserProfile();
-    const name = profile && (profile.displayName || profile.userName);
-    const cache = loadCache();
-    if (name && cache.displayName && cache.displayName !== name) clearCache();
-  } catch (_) { /* checked again on the next build */ }
-  cachedClient = client; // use the new session straight away
-  console.log(`Garmin login OK. Tokens saved to ${TOKEN_SAVE_DIR}.`);
-  return tokens;
+  return { client, tokens: client.exportToken() };
 }
 
 let cachedClient = null;
@@ -358,7 +349,9 @@ function emptyCache() {
 }
 
 function loadCache() {
-  if (CACHE) return CACHE;
+  // Paces are stored in the unit that was active when they were downloaded.
+  if (CACHE && CACHE.units === CONFIG.units) return CACHE;
+  CACHE = null;
   try {
     const data = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
     if (data.version === CACHE_VERSION && data.units === CONFIG.units) {
@@ -845,6 +838,7 @@ async function buildContext(client) {
       month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
     })),
     __BUILD_VERSION__: String(Date.now()),
+    __SW_ENABLED__: SERVER_MODE ? 'true' : 'false',
     __FOOTER_LINKS__: SERVER_MODE
       ? ' &middot; <a href="/refresh" style="color:inherit">Refresh now</a> &middot; <a href="/settings" style="color:inherit">Settings</a>'
       : '',
@@ -862,8 +856,8 @@ function renderHtml(ctx) {
   return html;
 }
 
-async function buildDashboard() {
-  const client = await getClient();
+async function buildDashboard(existingClient) {
+  const client = existingClient || await getClient();
   try {
     const ctx = await buildContext(client);
     return renderHtml(ctx);
@@ -927,6 +921,266 @@ function readBody(req, limit = 16 * 1024) {
 }
 
 // =============================================================================
+// Users — each Garmin account that signs in gets its own folder with its own
+// Garmin tokens, settings and downloaded data:
+//   <DATA_DIR>/users/<id>/{oauth1_token.json, oauth2_token.json, settings.json, cache.json}
+// Signing in to Garmin is also how you sign in to this site; a cookie then
+// remembers which user this browser belongs to.
+// =============================================================================
+const USERS_DIR = path.join(DATA_DIR, 'users');
+const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
+const SESSION_COOKIE = 'gd_sid';
+const SESSION_DAYS = 180;
+const ACTIVE_DAYS = 14; // stop auto-refreshing users who haven't opened the dashboard in this long
+
+const users = new Map(); // id -> runtime
+
+function writeJson(file, data) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, file);
+}
+
+function readJson(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (_) { return fallback; }
+}
+
+function userIdFor(profile) {
+  const key = String(profile.profileId || profile.id || profile.displayName || profile.userName || '');
+  if (!key) throw new SetupError("Garmin didn't return a profile for this account.");
+  return crypto.createHash('sha256').update(`garmin:${key}`).digest('hex').slice(0, 24);
+}
+
+function newRuntime(id, saved = {}) {
+  return {
+    id,
+    dir: path.join(USERS_DIR, id),
+    name: saved.garminName || '',
+    configured: !!saved.config,
+    config: { ...JSON.parse(JSON.stringify(DEFAULT_CONFIG)), ...(saved.config || {}),
+      personalBests: { ...DEFAULT_CONFIG.personalBests, ...((saved.config || {}).personalBests || {}) } },
+    client: null,
+    cache: null,
+    html: null, builtAt: null, version: null, lastError: null,
+    building: false, queued: false, rebuildAfter: false,
+    lastBuildAt: 0, lastSeen: 0,
+  };
+}
+
+function saveUserSettings(u) {
+  writeJson(path.join(u.dir, 'settings.json'), {
+    garminName: u.name, config: u.configured ? u.config : undefined, updatedAt: new Date().toISOString(),
+  });
+}
+
+function userHasTokens(u) {
+  return fs.existsSync(path.join(u.dir, 'oauth1_token.json')) && fs.existsSync(path.join(u.dir, 'oauth2_token.json'));
+}
+
+function loadAllUsers() {
+  let ids = [];
+  try { ids = fs.readdirSync(USERS_DIR); } catch (_) { /* none yet */ }
+  for (const id of ids) {
+    if (!/^[0-9a-f]{24}$/.test(id)) continue;
+    users.set(id, newRuntime(id, readJson(path.join(USERS_DIR, id, 'settings.json'), {})));
+  }
+}
+
+function deleteUser(u) {
+  fs.rmSync(u.dir, { recursive: true, force: true });
+  users.delete(u.id);
+  for (const [h, sess] of Object.entries(sessions)) if (sess.userId === u.id) delete sessions[h];
+  saveSessions();
+}
+
+// ---- Sessions (random cookie; only its hash is stored) ----
+let sessions = {};
+let sessionsDirty = false;
+const hashToken = (t) => crypto.createHash('sha256').update(t).digest('hex');
+
+function loadSessions() {
+  sessions = readJson(SESSIONS_FILE, {});
+  const cutoff = Date.now() - SESSION_DAYS * 86400000;
+  for (const [h, sess] of Object.entries(sessions)) if (!sess || sess.lastSeen < cutoff) delete sessions[h];
+}
+
+function saveSessions() {
+  try { writeJson(SESSIONS_FILE, sessions); sessionsDirty = false; } catch (e) { console.warn(`Could not save sessions: ${e.message}`); }
+}
+
+function parseCookies(req) {
+  const out = {};
+  for (const part of String(req.headers.cookie || '').split(';')) {
+    const i = part.indexOf('=');
+    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+  }
+  return out;
+}
+
+function isHttps(req) {
+  return req.socket.encrypted || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+}
+
+function sessionCookie(req, value, maxAgeSeconds) {
+  return `${SESSION_COOKIE}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}` + (isHttps(req) ? '; Secure' : '');
+}
+
+function createSession(req, userId) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  sessions[hashToken(token)] = { userId, created: Date.now(), lastSeen: Date.now() };
+  saveSessions();
+  return sessionCookie(req, token, SESSION_DAYS * 86400);
+}
+
+function currentUser(req) {
+  const token = parseCookies(req)[SESSION_COOKIE];
+  if (!token) return null;
+  const h = hashToken(token);
+  const sess = sessions[h];
+  if (!sess) return null;
+  const u = users.get(sess.userId);
+  if (!u) { delete sessions[h]; sessionsDirty = true; return null; }
+  const now = Date.now();
+  if (now - sess.lastSeen > 3600000) { sess.lastSeen = now; sessionsDirty = true; }
+  u.lastSeen = now;
+  u.sessionHash = h;
+  return u;
+}
+
+// ---- Garmin client per user ----
+async function userClient(u) {
+  if (u.client) return u.client;
+  if (!userHasTokens(u)) throw new SetupError('Your Garmin sign-in is missing. Please sign in again.');
+  const client = new GarminConnect({ username: '', password: '' }, GARMIN_DOMAIN);
+  client.loadToken(readJson(path.join(u.dir, 'oauth1_token.json')), readJson(path.join(u.dir, 'oauth2_token.json')));
+  try {
+    await client.getUserProfile(); // also refreshes an expired OAuth2 token
+  } catch (e) {
+    throw new SetupError('Your Garmin sign-in has expired. Please sign in again.');
+  }
+  u.client = client;
+  return client;
+}
+
+// =============================================================================
+// Build queue — builds run one at a time, because the build code works on the
+// shared CONFIG / cache variables. Each build swaps in that user's settings.
+// =============================================================================
+const buildQueue = [];
+let buildRunning = false;
+
+function queueBuild(u, { urgent = false } = {}) {
+  if (u.building) { u.rebuildAfter = true; return; }
+  if (u.queued) {
+    if (urgent) { const i = buildQueue.indexOf(u); if (i > 0) { buildQueue.splice(i, 1); buildQueue.unshift(u); } }
+    return;
+  }
+  u.queued = true;
+  if (urgent) buildQueue.unshift(u); else buildQueue.push(u);
+  pumpQueue();
+}
+
+function applyTimezone(tz) {
+  if (tz && validTimezone(tz)) process.env.TZ = tz;
+  else if (ORIGINAL_TZ) process.env.TZ = ORIGINAL_TZ;
+  else delete process.env.TZ;
+}
+
+async function runUserBuild(u) {
+  // Swap this user's settings and cache into the shared variables for the build.
+  CONFIG = u.config;
+  applyDerived();
+  applyTimezone(CONFIG.timezone);
+  CACHE_FILE = path.join(u.dir, 'cache.json');
+  CACHE = u.cache;
+  try {
+    const client = await userClient(u);
+    const html = await buildDashboard(client);
+    try { client.exportTokenToFile(u.dir); } catch (_) { /* keep going */ }
+    return html;
+  } catch (e) {
+    if (e && /401|403|unauthori[sz]ed/i.test(String(e.message))) u.client = null;
+    throw e;
+  } finally {
+    u.cache = CACHE;
+    CACHE = null;
+  }
+}
+
+async function pumpQueue() {
+  if (buildRunning) return;
+  buildRunning = true;
+  while (buildQueue.length) {
+    const u = buildQueue.shift();
+    u.queued = false;
+    if (!users.has(u.id)) continue; // deleted while waiting
+    u.building = true;
+    const started = Date.now();
+    try {
+      const html = await runUserBuild(u);
+      if (users.has(u.id)) {
+        u.html = html;
+        u.builtAt = new Date();
+        u.version = (html.match(/var v = '(\d+)'/) || [])[1] || String(Date.now());
+        u.lastError = null;
+      }
+      const c = CACHE_STATS;
+      console.log(`[${new Date().toISOString()}] Built dashboard for user ${u.id.slice(0, 6)} in ${Date.now() - started} ms ` +
+        `(${c.activityMode} sync; recovery fetched ${c.recoveryFetched}/cached ${c.recoveryFromCache}; ` +
+        `VO2 fetched ${c.vo2Fetched}/cached ${c.vo2FromCache}; unavailable: ${DIAGNOSTICS.missing.size}).`);
+    } catch (e) {
+      u.lastError = e instanceof SetupError ? e.message : `${e.name || 'Error'}: ${e.message}`;
+      console.error(`[${new Date().toISOString()}] Build failed for user ${u.id.slice(0, 6)}: ${u.lastError}`);
+    } finally {
+      u.building = false;
+      u.lastBuildAt = Date.now();
+      if (u.rebuildAfter && users.has(u.id)) { u.rebuildAfter = false; queueBuild(u); }
+    }
+  }
+  buildRunning = false;
+}
+
+// Every minute: queue a refresh for recently active users whose data is due.
+function tickScheduler() {
+  const now = Date.now();
+  for (const u of users.values()) {
+    if (u.building || u.queued || !userHasTokens(u)) continue;
+    if (now - u.lastSeen > ACTIVE_DAYS * 86400000) continue;
+    if (now - u.lastBuildAt >= u.config.refreshMinutes * 60000) queueBuild(u);
+  }
+  if (sessionsDirty) saveSessions();
+}
+
+// One-time move of a single-user setup (older versions) into the users folder.
+async function migrateLegacyData() {
+  let tokens;
+  try { tokens = loadTokens(); } catch (_) { return; }
+  try {
+    const client = new GarminConnect({ username: '', password: '' }, GARMIN_DOMAIN);
+    client.loadToken(tokens.oauth1, tokens.oauth2);
+    const profile = await client.getUserProfile();
+    const id = userIdFor(profile);
+    if (users.has(id)) return;
+    const u = newRuntime(id, { garminName: profile.displayName || '', config: SETTINGS.config });
+    fs.mkdirSync(u.dir, { recursive: true, mode: 0o700 });
+    client.exportTokenToFile(u.dir);
+    const legacyCache = path.join(DATA_DIR, 'cache.json');
+    if (fs.existsSync(legacyCache)) fs.renameSync(legacyCache, path.join(u.dir, 'cache.json'));
+    saveUserSettings(u);
+    users.set(id, u);
+    if (tokens.dir) {
+      for (const f of ['oauth1_token.json', 'oauth2_token.json']) {
+        try { fs.renameSync(path.join(tokens.dir, f), path.join(tokens.dir, `${f}.migrated`)); } catch (_) { /* ignore */ }
+      }
+    }
+    console.log(`Moved the existing single-user data into user ${id.slice(0, 6)}. Sign in to Garmin on the site to see it.`);
+  } catch (e) {
+    console.warn(`Could not move the old single-user data: ${e.message}`);
+  }
+}
+
+// =============================================================================
 // Settings form handling
 // =============================================================================
 function validateConfig(form) {
@@ -956,39 +1210,39 @@ function validateConfig(form) {
   return { config: c, errors };
 }
 
-function applyConfigChange(newConfig) {
-  const unitsChanged = newConfig.units !== CONFIG.units;
-  const refreshChanged = newConfig.refreshMinutes != null && newConfig.refreshMinutes !== CONFIG.refreshMinutes;
-  SETTINGS.config = { ...(SETTINGS.config || {}), ...newConfig };
-  delete SETTINGS.auth; // left over from versions that had a dashboard login
-  saveSettings();
-  loadSettings();
-  if (unitsChanged) clearCache(); // cached paces are stored in the old unit
-  if (refreshChanged) scheduleRefresh();
-  rebuild({ queue: true });
+function saveUserConfig(u, newConfig) {
+  const unitsChanged = newConfig.units !== u.config.units;
+  u.config = { ...u.config, ...newConfig, personalBests: { ...u.config.personalBests, ...(newConfig.personalBests || {}) } };
+  u.configured = true;
+  saveUserSettings(u);
+  if (unitsChanged) { // cached paces are stored in the old unit
+    u.cache = null;
+    try { fs.unlinkSync(path.join(u.dir, 'cache.json')); } catch (_) { /* none */ }
+  }
+  queueBuild(u, { urgent: true });
 }
 
-function configFields(full) {
+function configFields(full, cfg) {
   const v = (x) => escapeHtml(x == null ? '' : x);
-  const pb = CONFIG.personalBests || {};
+  const pb = cfg.personalBests || {};
   const pbVal = (k) => (pb[k] && pb[k] !== 'REPLACE_ME' && pb[k] !== '—' ? pb[k] : '');
-  const raceName = /REPLACE_ME/.test(CONFIG.raceName) ? '' : CONFIG.raceName;
+  const raceName = /REPLACE_ME/.test(cfg.raceName) ? '' : cfg.raceName;
   let html = `
 <label for="raceName">Race name</label><input id="raceName" name="raceName" required maxlength="80" value="${v(raceName)}">
 <div class="row">
-<div><label for="raceDate">Race date</label><input id="raceDate" name="raceDate" type="date" required value="${v(CONFIG.raceDate)}"></div>
+<div><label for="raceDate">Race date</label><input id="raceDate" name="raceDate" type="date" required value="${v(cfg.raceDate)}"></div>
 <div><label for="units">Distance units</label><select id="units" name="units">
-<option value="mi"${CONFIG.units === 'mi' ? ' selected' : ''}>Miles</option>
-<option value="km"${CONFIG.units === 'km' ? ' selected' : ''}>Kilometres</option></select></div>
+<option value="mi"${cfg.units === 'mi' ? ' selected' : ''}>Miles</option>
+<option value="km"${cfg.units === 'km' ? ' selected' : ''}>Kilometres</option></select></div>
 </div>
 <label for="timezone">Your timezone</label>
-<input id="timezone" name="timezone" maxlength="60" placeholder="America/Jamaica" value="${v(CONFIG.timezone)}">
+<input id="timezone" name="timezone" maxlength="60" placeholder="America/Jamaica" value="${v(cfg.timezone)}">
 <script>(function(){var t=document.getElementById('timezone');if(t&&!t.value){try{t.value=Intl.DateTimeFormat().resolvedOptions().timeZone||'';}catch(e){}}})();</script>`;
   if (full) {
     html += `
 <div class="row">
-<div><label for="heightCm">Height (cm)</label><input id="heightCm" name="heightCm" type="number" min="100" max="250" value="${v(CONFIG.heightCm)}"></div>
-<div><label for="weightKg">Weight (kg)</label><input id="weightKg" name="weightKg" type="number" min="30" max="250" step="0.1" value="${v(CONFIG.weightKg)}"></div>
+<div><label for="heightCm">Height (cm)</label><input id="heightCm" name="heightCm" type="number" min="100" max="250" value="${v(cfg.heightCm)}"></div>
+<div><label for="weightKg">Weight (kg)</label><input id="weightKg" name="weightKg" type="number" min="30" max="250" step="0.1" value="${v(cfg.weightKg)}"></div>
 </div>
 <div class="row">
 <div><label for="pb5k">5K best</label><input id="pb5k" name="pb5k" maxlength="20" placeholder="e.g. 21:30" value="${v(pbVal('5K'))}"></div>
@@ -997,51 +1251,44 @@ function configFields(full) {
 <div><label for="pbMarathon">Marathon best</label><input id="pbMarathon" name="pbMarathon" maxlength="20" placeholder="e.g. 3:29:00" value="${v(pbVal('Marathon'))}"></div>
 </div>
 <label for="refreshMinutes">Refresh from Garmin every (minutes)</label>
-<input id="refreshMinutes" name="refreshMinutes" type="number" min="5" max="1440" value="${v(CONFIG.refreshMinutes)}">`;
+<input id="refreshMinutes" name="refreshMinutes" type="number" min="5" max="1440" value="${v(cfg.refreshMinutes)}">`;
   }
   return html;
 }
 
-function garminStatus() {
-  try {
-    const t = loadTokens();
-    return { connected: true, fromEnv: t.dir === null };
-  } catch (_) {
-    return { connected: false, fromEnv: false };
-  }
-}
-
-function settingsPage(error = '', ok = '') {
-  const g = garminStatus();
-  const garminHtml = g.connected
-    ? `<p>Connected.${g.fromEnv ? ' (Using tokens from environment variables; remove them in hPanel to disconnect.)' : ''}</p>
-<a class="btn btn-quiet" href="/login">Sign in again</a>
-${g.fromEnv ? '' : `<form method="post" action="/settings/disconnect" style="display:inline">${csrfField()}
-<button class="btn-danger" type="submit" onclick="return confirm('Disconnect Garmin and delete the downloaded data?')">Disconnect Garmin</button></form>`}`
-    : '<p>Not connected.</p><a class="btn" href="/login">Sign in to Garmin</a>';
+function settingsPage(u, error = '', ok = '') {
   return page('Settings', `
 <p><a href="/">← Back to dashboard</a></p>
 <h1>Settings</h1>
 ${msgHtml(error, ok)}
 <form method="post" action="/settings">
 ${csrfField()}
-${configFields(true)}
+${configFields(true, u.config)}
 <button type="submit">Save settings</button>
 </form>
 <h2>Garmin account</h2>
-${garminHtml}`);
+<p>Signed in${u.name ? ` as <strong>${escapeHtml(u.name)}</strong>` : ''}.</p>
+<form method="post" action="/signout" style="display:inline">${csrfField()}
+<button class="btn-quiet" type="submit">Sign out on this device</button></form>
+<form method="post" action="/settings/delete" style="display:inline">${csrfField()}
+<button class="btn-danger" type="submit" onclick="return confirm('Delete your settings and downloaded data, and sign out everywhere?')">Delete my data</button></form>
+<p class="note">Deleting removes your Garmin connection, settings and downloaded data from this site. Your Garmin account itself isn't affected.</p>`);
 }
 
 // =============================================================================
-// Garmin sign-in page
+// Garmin sign-in page (this is also how you sign in to the site)
 // =============================================================================
-const loginGuard = { inFlight: false, failures: 0, lockedUntil: 0 };
+const signInGuard = { active: 0, failures: new Map() };
+const MAX_PARALLEL_SIGNINS = 3;
+
+function clientIp(req) {
+  return String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || '?';
+}
 
 function loginPage(errorMessage = '', email = '') {
-  return page('Connect Garmin', `
-<p><a href="/">← Back to dashboard</a></p>
-<h1>Connect your Garmin account</h1>
-<p>Your password is sent to Garmin once to get access tokens, then discarded. It is never stored.</p>
+  return page('Sign in with Garmin', `
+<h1>Training dashboard</h1>
+<p>Sign in with your Garmin Connect account to see your own training dashboard. Each person who signs in gets their own private dashboard.</p>
 ${msgHtml(errorMessage)}
 <form method="post" action="/login" autocomplete="on">
 ${csrfField()}
@@ -1051,98 +1298,168 @@ ${csrfField()}
 <input id="password" name="password" type="password" required autocomplete="current-password">
 <button type="submit">Sign in</button>
 </form>
-<p class="note">Two-step verification isn't supported by the Garmin library this app uses. If your account has it on, turn it off while you sign in, then turn it back on. The connection keeps working afterwards.</p>`);
+<p class="note">Your password is sent to Garmin once to get access tokens, then discarded. It is never stored.
+Two-step verification isn't supported by the Garmin library this app uses. If your account has it on, turn it off while you sign in, then turn it back on.</p>`);
 }
 
 async function handleLoginPost(req, res, form) {
+  const ip = clientIp(req);
   const now = Date.now();
-  if (loginGuard.lockedUntil > now) {
-    const mins = Math.ceil((loginGuard.lockedUntil - now) / 60000);
+  const f = signInGuard.failures.get(ip);
+  if (f && f.count >= 5 && f.resetAt > now) {
+    const mins = Math.ceil((f.resetAt - now) / 60000);
     return send(res, 429, loginPage(`Too many failed attempts. Try again in ${mins} minute(s) so Garmin doesn't lock your account.`));
   }
-  if (loginGuard.inFlight) return send(res, 429, loginPage('A sign-in is already in progress. Wait a moment.'));
+  if (signInGuard.active >= MAX_PARALLEL_SIGNINS) {
+    return send(res, 429, loginPage('Several people are signing in right now. Wait a few seconds and try again.'));
+  }
   const email = (form.get('email') || '').trim();
   const password = form.get('password') || '';
 
-  loginGuard.inFlight = true;
+  signInGuard.active += 1;
   try {
-    await loginToGarmin(email, password);
-    loginGuard.failures = 0;
-    state.lastError = null;
-    rebuild({ queue: true });
-    return redirect(res, SETTINGS.config ? '/' : '/settings?welcome=1');
-  } catch (e) {
-    loginGuard.failures += 1;
-    if (loginGuard.failures >= 5) {
-      loginGuard.lockedUntil = Date.now() + 15 * 60 * 1000;
-      loginGuard.failures = 0;
+    const { client, tokens } = await loginToGarmin(email, password);
+    const profile = await client.getUserProfile();
+    const id = userIdFor(profile);
+    let u = users.get(id);
+    const isNew = !u;
+    if (!u) {
+      u = newRuntime(id, {});
+      users.set(id, u);
     }
+    u.name = (profile && (profile.displayName || profile.fullName)) || u.name;
+    saveTokens(u.dir, tokens);
+    saveUserSettings(u);
+    u.client = client;
+    u.lastError = null;
+    u.lastSeen = Date.now();
+    signInGuard.failures.delete(ip);
+    queueBuild(u, { urgent: true });
+    console.log(`Garmin sign-in OK for ${isNew ? 'new' : 'existing'} user ${id.slice(0, 6)}.`);
+    const cookie = createSession(req, id);
+    res.writeHead(303, { Location: u.configured ? '/' : '/settings?welcome=1', 'Set-Cookie': cookie, 'Cache-Control': 'no-store' });
+    return res.end();
+  } catch (e) {
+    const cur = signInGuard.failures.get(ip);
+    if (!cur || cur.resetAt < Date.now()) signInGuard.failures.set(ip, { count: 1, resetAt: Date.now() + 15 * 60000 });
+    else cur.count += 1;
+    if (signInGuard.failures.size > 5000) signInGuard.failures.clear();
     const msg = e instanceof SetupError ? e.message : 'Sign-in failed unexpectedly. Check the Runtime Logs in hPanel.';
     if (!(e instanceof SetupError)) console.error('Garmin sign-in error:', e && e.message);
     return send(res, 401, loginPage(msg, email));
   } finally {
-    loginGuard.inFlight = false;
+    signInGuard.active -= 1;
   }
 }
 
-function disconnectGarmin() {
-  for (const dir of new Set([TOKEN_SAVE_DIR, path.join(__dirname, '.garminconnect')])) {
-    for (const f of ['oauth1_token.json', 'oauth2_token.json']) {
-      try { fs.unlinkSync(path.join(dir, f)); } catch (_) { /* already gone */ }
+// =============================================================================
+// Browser cache (service worker) — the browser keeps the last dashboard it
+// loaded, so the page opens even when you're offline, Hostinger is down, or
+// the server is still rebuilding after a restart. Cleared on sign-out.
+// =============================================================================
+const SERVICE_WORKER_JS = `
+const CACHE = 'dashboard-v2';
+const PAGE_KEY = '/__saved_dashboard';
+const NETWORK_TIMEOUT_MS = 4000;
+
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (event) => {
+  event.waitUntil((async () => {
+    for (const key of await caches.keys()) if (key !== CACHE) await caches.delete(key);
+    await self.clients.claim();
+  })());
+});
+
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('timeout')), ms);
+    promise.then((r) => { clearTimeout(t); resolve(r); }, (e) => { clearTimeout(t); reject(e); });
+  });
+}
+
+function timeAgo(iso) {
+  if (!iso) return 'an earlier visit';
+  const mins = Math.round((Date.now() - new Date(iso)) / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return mins + ' min ago';
+  const hrs = Math.round(mins / 60);
+  if (hrs < 48) return hrs + ' h ago';
+  return Math.round(hrs / 24) + ' days ago';
+}
+
+// Serve the saved dashboard with a small banner explaining why.
+async function savedPage(reason) {
+  const cache = await caches.open(CACHE);
+  const saved = await cache.match(PAGE_KEY);
+  if (!saved) return null;
+  const html = await saved.text();
+  const when = timeAgo(saved.headers.get('X-Built-At'));
+  const banner = '<div style="position:sticky;top:0;z-index:99;background:#E8B84B;color:#12151B;' +
+    'font:600 14px system-ui,sans-serif;padding:8px 16px;text-align:center">' + reason +
+    ' Showing your saved dashboard from ' + when + '.</div>';
+  const body = html.replace(/<body([^>]*)>/i, (m) => m + banner);
+  return new Response(body, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+}
+
+async function handleDashboard(request) {
+  const cache = await caches.open(CACHE);
+  let response;
+  try {
+    response = await withTimeout(fetch(request), NETWORK_TIMEOUT_MS);
+  } catch (e) {
+    return (await savedPage(navigator.onLine ? 'The server is not responding.' : 'You are offline.')) ||
+      new Response('<h1>Offline</h1><p>No saved copy of the dashboard yet.</p>',
+        { status: 503, headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  }
+  const status = response.headers.get('X-Dashboard-Status');
+  if (status === 'signed-out') {
+    await cache.delete(PAGE_KEY); // never show someone's saved dashboard after they sign out
+    return response;
+  }
+  if (response.ok && response.headers.get('X-Dashboard') === '1') {
+    await cache.put(PAGE_KEY, response.clone());
+    return response;
+  }
+  // Server is up but has no dashboard right now (restarting, building, Garmin problem).
+  if (status === 'building') {
+    return (await savedPage('Updating from Garmin; this page refreshes when it is ready.')) || response;
+  }
+  return response; // e.g. "Connect Garmin": show it so you can fix it
+}
+
+// Chart.js and fonts: use the saved copy, refresh it in the background.
+async function handleAsset(request) {
+  const cache = await caches.open(CACHE);
+  const saved = await cache.match(request);
+  const fresh = fetch(request).then((r) => {
+    if (r && (r.ok || r.type === 'opaque')) cache.put(request, r.clone());
+    return r;
+  }).catch(() => null);
+  return saved || (await fresh) || Response.error();
+}
+
+self.addEventListener('fetch', (event) => {
+  const req = event.request;
+  if (req.method !== 'GET') return;
+  const url = new URL(req.url);
+  if (url.origin === self.location.origin) {
+    if (req.mode === 'navigate' && (url.pathname === '/' || url.pathname === '/index.html')) {
+      event.respondWith(handleDashboard(req));
+    } else if (req.mode === 'navigate' && url.pathname === '/refresh') {
+      event.respondWith(fetch(req).catch(() => savedPage('You are offline, so it could not refresh.')
+        .then((r) => r || Response.error())));
     }
+    return; // settings, Garmin sign-in and /health always go to the server
   }
-  cachedClient = null;
-  clearCache();
-  state.html = null;
-  state.version = null;
-  state.lastError = null;
-}
+  if (/(^|\\.)cdnjs\\.cloudflare\\.com$|fonts\\.(googleapis|gstatic)\\.com$/.test(url.hostname)) {
+    event.respondWith(handleAsset(req));
+  }
+});
+`;
 
 // =============================================================================
-// Web server (Hostinger Node.js app mode)
+// Web server
 // =============================================================================
-const state = { html: null, builtAt: null, version: null, lastError: null, building: null, queued: false };
-let refreshTimer = null;
-
-function rebuild({ queue = false } = {}) {
-  if (state.building) {
-    if (queue) state.queued = true; // settings changed mid-build: build again afterwards
-    return state.building;
-  }
-  console.log(`[${new Date().toISOString()}] Building dashboard...`);
-  state.building = buildDashboard()
-    .then((html) => {
-      state.html = html;
-      state.builtAt = new Date();
-      state.version = (html.match(/var v = '(\d+)'/) || [])[1] || String(Date.now());
-      state.lastError = null;
-      const c = CACHE_STATS;
-      console.log(`[${new Date().toISOString()}] Dashboard built (${c.activityMode} activity sync; ` +
-        `recovery days fetched ${c.recoveryFetched}, cached ${c.recoveryFromCache}; ` +
-        `VO2 fetched ${c.vo2Fetched}, cached ${c.vo2FromCache}; unavailable fields: ${DIAGNOSTICS.missing.size}).`);
-    })
-    .catch((e) => {
-      state.lastError = e instanceof SetupError ? e.message : `${e.name || 'Error'}: ${e.message}`;
-      console.error(`[${new Date().toISOString()}] Build failed: ${state.lastError}`);
-    })
-    .finally(() => {
-      state.building = null;
-      if (state.queued) {
-        state.queued = false;
-        rebuild();
-      }
-    });
-  return state.building;
-}
-
-function scheduleRefresh() {
-  if (refreshTimer) clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(() => {
-    rebuild();
-    scheduleRefresh();
-  }, CONFIG.refreshMinutes * 60 * 1000);
-}
-
 function send(res, status, body, type = 'text/html; charset=utf-8', extra = {}) {
   res.writeHead(status, {
     'Content-Type': type,
@@ -1151,14 +1468,20 @@ function send(res, status, body, type = 'text/html; charset=utf-8', extra = {}) 
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
     'X-Robots-Tag': 'noindex, nofollow',
+    'Vary': 'Cookie',
     ...extra,
   });
   res.end(body);
 }
 
-function redirect(res, location) {
-  res.writeHead(303, { Location: location, 'Cache-Control': 'no-store' });
+function redirect(res, location, extra = {}) {
+  res.writeHead(303, { Location: location, 'Cache-Control': 'no-store', ...extra });
   res.end();
+}
+
+// Sign-out headers: drop the cookie and the browser's saved copy of the dashboard.
+function signOutHeaders(req) {
+  return { 'Set-Cookie': sessionCookie(req, '', 0), 'Clear-Site-Data': '"cache", "storage"' };
 }
 
 async function handleRequest(req, res) {
@@ -1166,11 +1489,17 @@ async function handleRequest(req, res) {
   const route = url.pathname.replace(/\/+$/, '') || '/';
   const isPost = req.method === 'POST';
 
-  if (route === '/health') {
-    // Public on purpose (Hostinger and the page's auto-reload use it), so no details here.
-    return send(res, 200, JSON.stringify({ ok: true, ready: !!state.html, version: state.version }), 'application/json');
-  }
   if (route === '/robots.txt') return send(res, 200, 'User-agent: *\nDisallow: /\n', 'text/plain');
+  if (route === '/sw.js') {
+    return send(res, 200, SERVICE_WORKER_JS, 'application/javascript; charset=utf-8', { 'Cache-Control': 'no-cache' });
+  }
+
+  const u = currentUser(req);
+
+  if (route === '/health') {
+    // Used by Hostinger and by the page's auto-reload; only your own build version is shown.
+    return send(res, 200, JSON.stringify(u ? { ok: true, ready: !!u.html, version: u.version } : { ok: true }), 'application/json');
+  }
 
   let form = null;
   if (isPost) {
@@ -1184,54 +1513,76 @@ async function handleRequest(req, res) {
     }
   }
 
-  if (route === '/setup') return redirect(res, '/');
-
   if (route === '/login') {
     if (isPost) return handleLoginPost(req, res, form);
     return send(res, 200, loginPage());
   }
 
+  if (route === '/signout' && isPost) {
+    if (u && u.sessionHash) { delete sessions[u.sessionHash]; saveSessions(); }
+    return redirect(res, '/login', signOutHeaders(req));
+  }
+
+  // ---- Everything below is per user ----
+  if (!u) {
+    if (route === '/' || route === '/index.html') {
+      return send(res, 200, loginPage(), undefined, { 'X-Dashboard-Status': 'signed-out' });
+    }
+    return redirect(res, '/login');
+  }
+
   if (route === '/settings') {
     if (!isPost) {
-      return send(res, 200, settingsPage('', url.searchParams.has('welcome')
+      return send(res, 200, settingsPage(u, '', url.searchParams.has('welcome')
         ? 'Garmin connected. Add your race below, then save.' : ''));
     }
     const { config, errors } = validateConfig(form);
-    if (errors.length) return send(res, 400, settingsPage(errors.join(' ')));
-    applyConfigChange(config);
-    return send(res, 200, settingsPage('', 'Saved. The dashboard is rebuilding with your changes.'));
+    if (errors.length) return send(res, 400, settingsPage(u, errors.join(' ')));
+    saveUserConfig(u, config);
+    return send(res, 200, settingsPage(u, '', 'Saved. Your dashboard is rebuilding with your changes.'));
   }
 
-  if (route === '/settings/disconnect' && isPost) {
-    disconnectGarmin();
-    return send(res, 200, settingsPage('', 'Garmin disconnected and downloaded data deleted.'));
+  if (route === '/settings/delete' && isPost) {
+    deleteUser(u);
+    console.log(`User ${u.id.slice(0, 6)} deleted their data.`);
+    return redirect(res, '/login', signOutHeaders(req));
   }
 
   if (route === '/refresh') {
-    const sinceLast = state.builtAt ? (Date.now() - state.builtAt) / 1000 : Infinity;
-    if (sinceLast >= MIN_MANUAL_REFRESH_SECONDS || state.lastError) rebuild();
+    const sinceLast = (Date.now() - u.lastBuildAt) / 1000;
+    if (sinceLast >= MIN_MANUAL_REFRESH_SECONDS || u.lastError) queueBuild(u, { urgent: true });
     return redirect(res, '/');
   }
 
   if (route === '/' || route === '/index.html') {
-    if (state.html) return send(res, 200, state.html);
-    if (state.building) {
-      return send(res, 200, statusPage('Building your dashboard…',
-        'Pulling data from Garmin Connect. The first build can take a minute or two; this page reloads itself.', 10));
+    if (u.html) {
+      // Coming back after a break: refresh in the background if the data is stale.
+      if (!u.building && !u.queued && Date.now() - u.lastBuildAt >= u.config.refreshMinutes * 60000) queueBuild(u, { urgent: true });
+      return send(res, 200, u.html, undefined, {
+        'X-Dashboard': '1', 'X-Built-At': u.builtAt ? u.builtAt.toISOString() : '',
+      });
     }
-    const g = garminStatus();
-    const actions = g.connected
-      ? '<a class="btn" href="/refresh">Try again</a> &nbsp; <a href="/login">Sign in to Garmin again</a> &nbsp; <a href="/settings">Settings</a>'
-      : '<a class="btn" href="/login">Sign in to Garmin</a> &nbsp; <a href="/settings">Settings</a>';
-    return send(res, 503, statusPage(g.connected ? 'Dashboard unavailable' : 'Connect Garmin',
-      state.lastError || 'Not built yet.', 0, actions));
+    if (!u.building && !u.queued && !u.lastError) queueBuild(u, { urgent: true });
+    if (u.building || u.queued) {
+      const ahead = u.queued ? buildQueue.indexOf(u) : -1;
+      return send(res, 200, statusPage('Building your dashboard…',
+        'Pulling your data from Garmin Connect. The first build can take a minute or two' +
+        (ahead > 0 ? ` (${ahead} other dashboard${ahead > 1 ? 's are' : ' is'} ahead of yours)` : '') +
+        '; this page reloads itself.', 10), undefined, { 'X-Dashboard-Status': 'building' });
+    }
+    return send(res, 503, statusPage('Dashboard unavailable', u.lastError, 0,
+      '<a class="btn" href="/refresh">Try again</a> &nbsp; <a href="/login">Sign in to Garmin again</a> &nbsp; <a href="/settings">Settings</a>'));
   }
 
   send(res, 404, 'Not found', 'text/plain');
 }
 
-function startServer() {
+async function startServer() {
   SERVER_MODE = true;
+  loadSessions();
+  loadAllUsers();
+  await migrateLegacyData();
+
   const server = http.createServer((req, res) => {
     handleRequest(req, res).catch((e) => {
       console.error('Request error:', e && e.stack ? e.stack : e);
@@ -1240,12 +1591,19 @@ function startServer() {
   });
 
   server.listen(PORT, () => {
-    console.log(`Training dashboard listening on port ${PORT} (refresh every ${CONFIG.refreshMinutes} min).`);
-    rebuild();
-    scheduleRefresh();
+    console.log(`Training dashboard listening on port ${PORT}. ${users.size} user(s) on file.`);
+    // Pick up where each active user left off.
+    const lastSeen = {};
+    for (const sess of Object.values(sessions)) lastSeen[sess.userId] = Math.max(lastSeen[sess.userId] || 0, sess.lastSeen);
+    for (const u of users.values()) u.lastSeen = lastSeen[u.id] || 0;
+    tickScheduler();
+    setInterval(tickScheduler, 60000);
   });
 
-  const shutdown = () => server.close(() => process.exit(0));
+  const shutdown = () => {
+    if (sessionsDirty) saveSessions();
+    server.close(() => process.exit(0));
+  };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 }
@@ -1297,7 +1655,9 @@ async function cliLogin() {
   const email = (await ask('Garmin email: ')).trim();
   const password = await ask('Garmin password: ', { hidden: true });
   console.log('Signing in...');
-  await loginToGarmin(email, password);
+  const { tokens } = await loginToGarmin(email, password);
+  saveTokens(TOKEN_SAVE_DIR, tokens);
+  console.log(`Garmin login OK. Tokens saved to ${TOKEN_SAVE_DIR}.`);
   console.log('\nTo use these tokens on Hostinger, add these environment variables:\n');
   printTokenEnv();
 }
@@ -1313,7 +1673,7 @@ function run() {
   if (args.includes('--print-token-env')) {
     try { return printTokenEnv(); } catch (e) { return fail(e); }
   }
-  return startServer();
+  return startServer().catch(fail);
 }
 
 // =============================================================================
@@ -1585,15 +1945,19 @@ new Chart(document.getElementById('vo2Chart'), {
 });
 </script>
 <script>
-// Reload when the server has a newer build (every minute, only while the tab is visible).
+// Keep a copy of this page in the browser so it opens offline (server mode only).
+if (__SW_ENABLED__ && 'serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js').catch(function(){});
+}
+// Reload when the server has a newer build (checks every 20 s, only while the tab is visible).
 (function(){
   var v = '__BUILD_VERSION__';
   setInterval(function(){
     if (document.hidden) return;
     fetch('/health', {cache:'no-store'}).then(function(r){ return r.json(); }).then(function(h){
-      if (h && h.version && String(h.version) !== v) location.reload();
+      if (h && h.ready && h.version && String(h.version) !== v) location.reload();
     }).catch(function(){});
-  }, 60000);
+  }, 20000);
 })();
 </script>
 </body>
