@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>REPLACE_ME Marathon — Training Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<style>
+  :root{
+    --bg:#12151B; --surface:#1A1E26; --surface-2:#20242D; --border:#2A2F3A;
+    --text:#EDEFF3; --text-dim:#8A90A0;
+    --easy:#4FD1C5; --hard:#E94F64; --gold:#E8B84B; --line:#6E86FF;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:'Inter',system-ui,sans-serif; line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+  }
+  h1,h2,h3,.num{font-family:'Space Grotesk',system-ui,sans-serif;}
+  .wrap{max-width:1180px; margin:0 auto; padding:32px 24px 80px;}
+
+  header.hero{
+    display:flex; flex-wrap:wrap; gap:28px; align-items:flex-end; justify-content:space-between;
+    padding-bottom:28px; border-bottom:1px solid var(--border); margin-bottom:32px;
+  }
+  .hero-left h1{font-size:26px; font-weight:600; margin:0 0 6px;}
+  .hero-left .race-date{color:var(--text-dim); font-size:14px;}
+  .countdown{text-align:right;}
+  .countdown .num{font-size:56px; font-weight:700; line-height:1; color:var(--gold);}
+  .countdown .label{color:var(--text-dim); font-size:13px; margin-top:4px;}
+  .countdown .sub{font-size:14px; color:var(--text-dim); margin-top:2px;}
+
+  .context-row{display:flex; flex-wrap:wrap; gap:28px; margin-bottom:36px; color:var(--text-dim); font-size:14px;}
+  .pbs{display:flex; flex-wrap:wrap; gap:18px;}
+  .pb{display:flex; flex-direction:column; gap:2px;}
+  .pb-dist{font-size:12px; color:var(--text-dim);}
+  .pb-time{font-family:'Space Grotesk',sans-serif; font-weight:600; color:var(--text); font-size:15px;}
+
+  section{margin-bottom:36px;}
+  .section-head{display:flex; justify-content:space-between; align-items:baseline; margin-bottom:14px;}
+  .section-head h2{font-size:16px; font-weight:600; margin:0;}
+  .section-head .note{font-size:13px; color:var(--text-dim);}
+
+  .card{
+    background:var(--surface); border:1px solid var(--border); border-radius:6px;
+    padding:20px;
+  }
+  .grid-3{display:grid; grid-template-columns:repeat(3,1fr); gap:16px;}
+  .grid-2{display:grid; grid-template-columns:1.3fr 1fr; gap:16px;}
+  @media(max-width:820px){ .grid-3{grid-template-columns:1fr;} .grid-2{grid-template-columns:1fr;} }
+
+  .status-strip{display:flex; gap:28px; margin-bottom:16px; flex-wrap:wrap;}
+  .status-item .v{font-family:'Space Grotesk',sans-serif; font-size:28px; font-weight:600;}
+  .status-item .k{font-size:12px; color:var(--text-dim); margin-top:2px;}
+  .v.ctl{color:var(--line);} .v.atl{color:var(--hard);} .v.tsb{color:var(--gold);}
+
+  canvas{max-width:100%;}
+
+  table{width:100%; border-collapse:collapse; font-size:14px;}
+  th{text-align:left; font-weight:500; color:var(--text-dim); font-size:12px; padding:8px 10px; border-bottom:1px solid var(--border);}
+  td{padding:9px 10px; border-bottom:1px solid var(--border);}
+  tr:last-child td{border-bottom:none;}
+  td.empty{color:var(--text-dim); text-align:center; padding:24px;}
+
+  .tag{display:inline-block; padding:2px 9px; border-radius:4px; font-size:12px; font-weight:500;}
+  .tag-easy{background:rgba(79,209,197,0.15); color:var(--easy);}
+  .tag-workout{background:rgba(233,79,100,0.15); color:var(--hard);}
+  .tag-long{background:rgba(232,184,75,0.15); color:var(--gold);}
+
+  .diagnostics{margin-top:36px; font-size:13px; color:var(--text-dim);}
+  .diagnostics summary{cursor:pointer;}
+  .diagnostics ul{columns:2; margin:10px 0 0;}
+  footer{color:var(--text-dim); font-size:12px; margin-top:40px; border-top:1px solid var(--border); padding-top:16px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <div class="hero-left">
+      <h1>REPLACE_ME Marathon</h1>
+      <div class="race-date">Race day: December 31, 2026</div>
+    </div>
+    <div class="countdown">
+      <div class="num">96</div>
+      <div class="label">days to go</div>
+      <div class="sub">13 weeks remaining</div>
+    </div>
+  </header>
+
+  <div class="context-row">
+    <div>178 cm &middot; 70 kg</div>
+    <div class="pbs"><div class="pb"><span class="pb-dist">5K</span><span class="pb-time">REPLACE_ME</span></div><div class="pb"><span class="pb-dist">10K</span><span class="pb-time">REPLACE_ME</span></div><div class="pb"><span class="pb-dist">Half Marathon</span><span class="pb-time">REPLACE_ME</span></div><div class="pb"><span class="pb-dist">Marathon</span><span class="pb-time">REPLACE_ME</span></div></div>
+  </div>
+
+  <section>
+    <div class="section-head">
+      <h2>Training load — fitness, fatigue, form</h2>
+      <span class="note">last 12 weeks</span>
+    </div>
+    <div class="card">
+      <div class="status-strip">
+        <div class="status-item"><div class="v ctl">0</div><div class="k">CTL &middot; fitness</div></div>
+        <div class="status-item"><div class="v atl">0</div><div class="k">ATL &middot; fatigue</div></div>
+        <div class="status-item"><div class="v tsb">+0</div><div class="k">TSB &middot; form</div></div>
+      </div>
+      <canvas id="loadChart" height="90"></canvas>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Weekly mileage</h2>
+      <span class="note">mi per week, with trend</span>
+    </div>
+    <div class="card"><canvas id="mileageChart" height="70"></canvas></div>
+  </section>
+
+  <section>
+    <div class="section-head"><h2>Recovery</h2><span class="note">last few weeks</span></div>
+    <div class="grid-3">
+      <div class="card"><h3 style="font-size:13px;color:var(--text-dim);margin:0 0 10px;">HRV (ms)</h3><canvas id="hrvChart" height="140"></canvas></div>
+      <div class="card"><h3 style="font-size:13px;color:var(--text-dim);margin:0 0 10px;">Resting heart rate</h3><canvas id="rhrChart" height="140"></canvas></div>
+      <div class="card"><h3 style="font-size:13px;color:var(--text-dim);margin:0 0 10px;">Sleep</h3><canvas id="sleepChart" height="140"></canvas></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="grid-2">
+      <div>
+        <div class="section-head"><h2>Pace: easy vs. workout</h2><span class="note">median per week, min/mi</span></div>
+        <div class="card">
+          <div style="font-size:13px;color:var(--text-dim);margin-bottom:10px;">Baseline easy pace: — /mi</div>
+          <canvas id="paceChart" height="130"></canvas>
+        </div>
+      </div>
+      <div>
+        <div class="section-head"><h2>VO2 max</h2><span class="note">trend</span></div>
+        <div class="card"><canvas id="vo2Chart" height="130"></canvas></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head"><h2>Recent runs</h2><span class="note">last few weeks</span></div>
+    <div class="card">
+      <table>
+        <thead><tr><th>Date</th><th>Distance</th><th>Pace</th><th>Avg HR</th><th>Type</th></tr></thead>
+        <tbody>
+<tr><td colspan="5" class="empty">No runs found in this window.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <details class="diagnostics"><summary>Fields unavailable this run (56)</summary><ul><li>hrv 2026-08-15 (empty response)</li><li>hrv 2026-08-16 (empty response)</li><li>hrv 2026-08-17 (empty response)</li><li>hrv 2026-08-18 (empty response)</li><li>hrv 2026-08-19 (empty response)</li><li>hrv 2026-08-20 (empty response)</li><li>hrv 2026-08-21 (empty response)</li><li>hrv 2026-08-22 (empty response)</li><li>hrv 2026-08-23 (empty response)</li><li>hrv 2026-08-24 (empty response)</li><li>hrv 2026-08-25 (empty response)</li><li>hrv 2026-08-26 (empty response)</li><li>hrv 2026-08-27 (empty response)</li><li>hrv 2026-08-28 (empty response)</li><li>hrv 2026-08-29 (empty response)</li><li>hrv 2026-08-30 (empty response)</li><li>hrv 2026-08-31 (empty response)</li><li>hrv 2026-09-01 (empty response)</li><li>hrv 2026-09-02 (empty response)</li><li>hrv 2026-09-03 (empty response)</li><li>hrv 2026-09-04 (empty response)</li><li>hrv 2026-09-05 (empty response)</li><li>hrv 2026-09-06 (empty response)</li><li>hrv 2026-09-07 (empty response)</li><li>hrv 2026-09-08 (empty response)</li><li>hrv 2026-09-09 (empty response)</li><li>hrv 2026-09-10 (empty response)</li><li>hrv 2026-09-11 (empty response)</li><li>hrv 2026-09-12 (empty response)</li><li>hrv 2026-09-13 (empty response)</li><li>hrv 2026-09-14 (empty response)</li><li>hrv 2026-09-15 (empty response)</li><li>hrv 2026-09-16 (empty response)</li><li>hrv 2026-09-17 (empty response)</li><li>hrv 2026-09-18 (empty response)</li><li>hrv 2026-09-19 (empty response)</li><li>hrv 2026-09-20 (empty response)</li><li>hrv 2026-09-21 (empty response)</li><li>hrv 2026-09-22 (empty response)</li><li>hrv 2026-09-23 (empty response)</li><li>hrv 2026-09-24 (empty response)</li><li>hrv 2026-09-25 (empty response)</li><li>hrv 2026-09-26 (empty response)</li><li>max metrics 2026-07-04 (Error: ERROR: (404), Not Found, &quot;&lt;!doctype html&gt;&lt;html lang=\&quot;en\&quot;&gt;&lt;head&gt;&lt;title&gt;HTTP Sta)</li><li>max metrics 2026-07-11 (Error: ERROR: (404), Not Found, &quot;&lt;!doctype html&gt;&lt;html lang=\&quot;en\&quot;&gt;&lt;head&gt;&lt;title&gt;HTTP Sta)</li><li>max metrics 2026-07-18 (Error: ERROR: (404), Not Found, &quot;&lt;!doctype html&gt;&lt;html lang=\&quot;en\&quot;&gt;&lt;head&gt;&lt;title&gt;HTTP Sta)</li><li>max metrics 2026-07-25 (Error: ERROR: (404), Not Found, &quot;&lt;!doctype html&gt;&lt;html lang=\&quot;en\&quot;&gt;&lt;head&gt;&lt;title&gt;HTTP Sta)</li><li>max metrics 2026-08-01 (Error: ERROR: (404), Not Found, &quot;&lt;!doctype html&gt;&lt;html lang=\&quot;en\&quot;&gt;&lt;head&gt;&lt;title&gt;HTTP Sta)</li><li>max metrics 2026-08-08 (Error: ERROR: (404), Not Found, &quot;&lt;!doctype html&gt;&lt;html lang=\&quot;en\&quot;&gt;&lt;head&gt;&lt;title&gt;HTTP Sta)</li><li>max metrics 2026-08-15 (Error: ERROR: (404), Not Found, &quot;&lt;!doctype html&gt;&lt;html lang=\&quot;en\&quot;&gt;&lt;head&gt;&lt;title&gt;HTTP Sta)</li><li>max metrics 2026-08-22 (Error: ERROR: (404), Not Found, &quot;&lt;!doctype html&gt;&lt;html lang=\&quot;en\&quot;&gt;&lt;head&gt;&lt;title&gt;HTTP Sta)</li><li>max metrics 2026-08-29 (Error: ERROR: (404), Not Found, &quot;&lt;!doctype html&gt;&lt;html lang=\&quot;en\&quot;&gt;&lt;head&gt;&lt;title&gt;HTTP Sta)</li><li>max metrics 2026-09-05 (Error: ERROR: (404), Not Found, &quot;&lt;!doctype html&gt;&lt;html lang=\&quot;en\&quot;&gt;&lt;head&gt;&lt;title&gt;HTTP Sta)</li><li>max metrics 2026-09-12 (Error: ERROR: (404), Not Found, &quot;&lt;!doctype html&gt;&lt;html lang=\&quot;en\&quot;&gt;&lt;head&gt;&lt;title&gt;HTTP Sta)</li><li>max metrics 2026-09-19 (Error: ERROR: (404), Not Found, &quot;&lt;!doctype html&gt;&lt;html lang=\&quot;en\&quot;&gt;&lt;head&gt;&lt;title&gt;HTTP Sta)</li><li>max metrics 2026-09-26 (Error: ERROR: (404), Not Found, &quot;&lt;!doctype html&gt;&lt;html lang=\&quot;en\&quot;&gt;&lt;head&gt;&lt;title&gt;HTTP Sta)</li></ul></details>
+
+  <footer>Generated 2026-09-26 06:34 UTC from your Garmin Connect data. Refreshes automatically.</footer>
+</div>
+
+<script>
+Chart.defaults.color = '#8A90A0';
+Chart.defaults.borderColor = '#2A2F3A';
+Chart.defaults.font.family = "'Inter', system-ui, sans-serif";
+
+function grid(){ return { grid:{ color:'#2A2F3A' } }; }
+
+new Chart(document.getElementById('loadChart'), {
+  type:'line',
+  data:{
+    labels: ["2026-07-04","2026-07-05","2026-07-06","2026-07-07","2026-07-08","2026-07-09","2026-07-10","2026-07-11","2026-07-12","2026-07-13","2026-07-14","2026-07-15","2026-07-16","2026-07-17","2026-07-18","2026-07-19","2026-07-20","2026-07-21","2026-07-22","2026-07-23","2026-07-24","2026-07-25","2026-07-26","2026-07-27","2026-07-28","2026-07-29","2026-07-30","2026-07-31","2026-08-01","2026-08-02","2026-08-03","2026-08-04","2026-08-05","2026-08-06","2026-08-07","2026-08-08","2026-08-09","2026-08-10","2026-08-11","2026-08-12","2026-08-13","2026-08-14","2026-08-15","2026-08-16","2026-08-17","2026-08-18","2026-08-19","2026-08-20","2026-08-21","2026-08-22","2026-08-23","2026-08-24","2026-08-25","2026-08-26","2026-08-27","2026-08-28","2026-08-29","2026-08-30","2026-08-31","2026-09-01","2026-09-02","2026-09-03","2026-09-04","2026-09-05","2026-09-06","2026-09-07","2026-09-08","2026-09-09","2026-09-10","2026-09-11","2026-09-12","2026-09-13","2026-09-14","2026-09-15","2026-09-16","2026-09-17","2026-09-18","2026-09-19","2026-09-20","2026-09-21","2026-09-22","2026-09-23","2026-09-24","2026-09-25","2026-09-26"],
+    datasets:[
+      {label:'CTL (fitness)', data: [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], borderColor:'#6E86FF', backgroundColor:'transparent', tension:0.25, pointRadius:0, borderWidth:2},
+      {label:'ATL (fatigue)', data: [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], borderColor:'#E94F64', backgroundColor:'transparent', tension:0.25, pointRadius:0, borderWidth:2},
+      {label:'TSB (form)', data: [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0], borderColor:'#E8B84B', backgroundColor:'transparent', tension:0.25, pointRadius:0, borderWidth:2, yAxisID:'y1'},
+    ]
+  },
+  options:{
+    interaction:{mode:'index', intersect:false},
+    scales:{
+      x:{ticks:{maxTicksLimit:10}, grid:{display:false}},
+      y:{title:{display:true,text:'load'}, ...grid()},
+      y1:{position:'right', grid:{display:false}, title:{display:true,text:'form'}},
+    },
+    plugins:{legend:{position:'top', align:'start', labels:{boxWidth:10}}}
+  }
+});
+
+new Chart(document.getElementById('mileageChart'), {
+  data:{
+    labels: [],
+    datasets:[
+      {type:'bar', label:'mi', data: [], backgroundColor:'#4FD1C5', borderRadius:3},
+      {type:'line', label:'trend', data: [], borderColor:'#E8B84B', borderWidth:2, pointRadius:0, tension:0},
+    ]
+  },
+  options:{
+    scales:{ x:{grid:{display:false}}, y:{...grid(), title:{display:true,text:'mi'}} },
+    plugins:{legend:{position:'top', align:'start', labels:{boxWidth:10}}}
+  }
+});
+
+function smallLine(id, labels, data, color){
+  new Chart(document.getElementById(id), {
+    type:'line',
+    data:{labels: labels, datasets:[{data: data, borderColor: color, backgroundColor:'transparent', tension:0.3, pointRadius:0, borderWidth:2, spanGaps:true}]},
+    options:{
+      plugins:{legend:{display:false}},
+      scales:{ x:{ticks:{maxTicksLimit:6}, grid:{display:false}}, y:{...grid()} }
+    }
+  });
+}
+smallLine('hrvChart', ["2026-08-15","2026-08-16","2026-08-17","2026-08-18","2026-08-19","2026-08-20","2026-08-21","2026-08-22","2026-08-23","2026-08-24","2026-08-25","2026-08-26","2026-08-27","2026-08-28","2026-08-29","2026-08-30","2026-08-31","2026-09-01","2026-09-02","2026-09-03","2026-09-04","2026-09-05","2026-09-06","2026-09-07","2026-09-08","2026-09-09","2026-09-10","2026-09-11","2026-09-12","2026-09-13","2026-09-14","2026-09-15","2026-09-16","2026-09-17","2026-09-18","2026-09-19","2026-09-20","2026-09-21","2026-09-22","2026-09-23","2026-09-24","2026-09-25","2026-09-26"], [null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null], '#4FD1C5');
+smallLine('rhrChart', ["2026-08-15","2026-08-16","2026-08-17","2026-08-18","2026-08-19","2026-08-20","2026-08-21","2026-08-22","2026-08-23","2026-08-24","2026-08-25","2026-08-26","2026-08-27","2026-08-28","2026-08-29","2026-08-30","2026-08-31","2026-09-01","2026-09-02","2026-09-03","2026-09-04","2026-09-05","2026-09-06","2026-09-07","2026-09-08","2026-09-09","2026-09-10","2026-09-11","2026-09-12","2026-09-13","2026-09-14","2026-09-15","2026-09-16","2026-09-17","2026-09-18","2026-09-19","2026-09-20","2026-09-21","2026-09-22","2026-09-23","2026-09-24","2026-09-25","2026-09-26"], [null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null], '#E94F64');
+
+new Chart(document.getElementById('sleepChart'), {
+  data:{
+    labels: ["2026-08-15","2026-08-16","2026-08-17","2026-08-18","2026-08-19","2026-08-20","2026-08-21","2026-08-22","2026-08-23","2026-08-24","2026-08-25","2026-08-26","2026-08-27","2026-08-28","2026-08-29","2026-08-30","2026-08-31","2026-09-01","2026-09-02","2026-09-03","2026-09-04","2026-09-05","2026-09-06","2026-09-07","2026-09-08","2026-09-09","2026-09-10","2026-09-11","2026-09-12","2026-09-13","2026-09-14","2026-09-15","2026-09-16","2026-09-17","2026-09-18","2026-09-19","2026-09-20","2026-09-21","2026-09-22","2026-09-23","2026-09-24","2026-09-25","2026-09-26"],
+    datasets:[
+      {type:'bar', label:'hours', data: [null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null], backgroundColor:'#6E86FF', borderRadius:2},
+      {type:'line', label:'score', data: [null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null], borderColor:'#E8B84B', pointRadius:0, borderWidth:2, yAxisID:'y1', spanGaps:true},
+    ]
+  },
+  options:{
+    plugins:{legend:{display:false}},
+    scales:{
+      x:{ticks:{maxTicksLimit:6}, grid:{display:false}},
+      y:{...grid(), title:{display:true,text:'hrs'}},
+      y1:{position:'right', grid:{display:false}, min:0, max:100, title:{display:true,text:'score'}},
+    }
+  }
+});
+
+new Chart(document.getElementById('paceChart'), {
+  type:'line',
+  data:{
+    labels: [],
+    datasets:[
+      {label:'Easy', data: [], borderColor:'#4FD1C5', backgroundColor:'transparent', tension:0.25, pointRadius:3, borderWidth:2, spanGaps:true},
+      {label:'Workout', data: [], borderColor:'#E94F64', backgroundColor:'transparent', tension:0.25, pointRadius:3, borderWidth:2, spanGaps:true},
+    ]
+  },
+  options:{
+    scales:{
+      x:{ticks:{maxTicksLimit:8}, grid:{display:false}},
+      y:{reverse:true, ...grid(), title:{display:true,text:'sec/mi (lower = faster, axis flipped)'}},
+    },
+    plugins:{legend:{position:'top', align:'start', labels:{boxWidth:10}}}
+  }
+});
+
+new Chart(document.getElementById('vo2Chart'), {
+  type:'line',
+  data:{labels: [], datasets:[{label:'VO2max', data: [], borderColor:'#E8B84B', backgroundColor:'transparent', tension:0.3, pointRadius:3, borderWidth:2, spanGaps:true}]},
+  options:{
+    plugins:{legend:{display:false}},
+    scales:{ x:{ticks:{maxTicksLimit:8}, grid:{display:false}}, y:{...grid()} }
+  }
+});
+</script>
+</body>
+</html>
